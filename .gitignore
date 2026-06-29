@@ -1,3 +1,6 @@
+# Claude Code project files — never commit
+.claude/
+
 # API key and personal config — never commit
 permit_scan_config.json
 
