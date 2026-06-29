@@ -1,0 +1,17 @@
+# API key and personal config — never commit
+permit_scan_config.json
+
+# Scan history — personal data
+permit_scan_history.json
+
+# Debug log
+permit_scan_debug.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+Thumbs.db
+.DS_Store
