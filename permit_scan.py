@@ -11,15 +11,27 @@ from watchdog.events import FileSystemEventHandler
 import shutil
 import subprocess
 
+_HOME          = os.path.expanduser("~")
 SCAN_FOLDERS   = [r"U:\Documents\Scans", r"F:\scan"]
-STAGING_FOLDER = r"C:\Users\nkhoury\Documents\Permit Staging"
-HISTORY_FILE   = r"C:\Users\nkhoury\permit_scan_history.json"
-CONFIG_FILE    = r"C:\Users\nkhoury\permit_scan_config.json"
+STAGING_FOLDER = os.path.join(_HOME, "Documents", "Permit Staging")
+HISTORY_FILE   = os.path.join(_HOME, "permit_scan_history.json")
+CONFIG_FILE    = os.path.join(_HOME, "permit_scan_config.json")
+DEBUG_LOG      = os.path.join(_HOME, "permit_scan_debug.log")
 SKIP_EXTENSIONS   = {".tmp", ".part", ".crdownload", ""}
-TESSERACT_PATH    = r"C:\Users\nkhoury\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
-STREET_LIST_FILE  = r"C:\Users\nkhoury\yorktown_streets.txt"
+TESSERACT_PATH    = os.path.join(_HOME, "AppData", "Local", "Programs", "Tesseract-OCR", "tesseract.exe")
+STREET_LIST_FILE  = os.path.join(_HOME, "yorktown_streets.txt")
 
 IGNORE_ADDRESSES = ["363 UNDERHILL AVE"]
+
+# Source tracking
+# tesseract_hw = Tesseract on handwriting — less reliable than Claude for numeric fields
+_SOURCE_RANK = {"native": 4, "tesseract": 3, "claude": 2, "tesseract_hw": 1, "": 0}
+_SRC_STYLE   = {
+    "native":       ("text",       "#2e7d32"),
+    "tesseract":    ("ocr",        "#e65100"),
+    "claude":       ("ai  ←verify","#1565c0"),
+    "tesseract_hw": ("ocr?",       "#92400e"),
+}
 
 def _load_known_streets():
     if not os.path.exists(STREET_LIST_FILE):
@@ -54,9 +66,9 @@ SITE_LABELS = [
     r"job\s+location",
     r"work\s+(?:site\s+)?address",
     r"address\s+of\s+(?:work|job|premises)",
-    r"location\s+of\s+(?:construction|building|work)",
-    r"present\s+address\s+of\s+owner",
-    r"address\s+of\s+owner",
+    r"location\s+of\s+(?:construction|building|work|project)",
+    # "present address of owner" / "address of owner" intentionally excluded —
+    # those are the owner's mailing address, not the job site.
     r"location",
 ]
 
@@ -83,13 +95,6 @@ def detect_permit_type(text):
     return "unknown"
 
 
-def extract_native_text(filepath):
-    import fitz
-    doc = fitz.open(filepath)
-    text = "\n".join(doc[i].get_text() for i in range(min(3, len(doc))))
-    doc.close()
-    return text
-
 
 def extract_text_from_page(doc, page_idx):
     """Tesseract OCR a single already-open fitz page; combines native + OCR text.
@@ -112,7 +117,7 @@ def extract_text_from_page(doc, page_idx):
     img_proc = preprocess_for_ocr(Image.open(io.BytesIO(png_bytes)))
     ocr_b = ocr_image(img_proc, pytesseract)
 
-    ocr = ocr_a if len(ocr_a) >= len(ocr_b) else ocr_b
+    ocr = ocr_a if _ascii_score(ocr_a) >= _ascii_score(ocr_b) else ocr_b
     return (native + "\n" + ocr).strip()
 
 
@@ -124,39 +129,17 @@ def preprocess_for_ocr(img):
     return img
 
 
+def _ascii_score(t):
+    return sum(1 for c in t if c.isascii() and (c.isalnum() or c in ' \n.,:-#/'))
+
+
 def ocr_image(img, pytesseract):
     cfg3  = "--oem 1 --psm 3"   # LSTM + auto layout detection (good for forms)
     cfg6  = "--oem 1 --psm 6"   # LSTM + uniform block
     cfg11 = "--oem 1 --psm 11"  # LSTM + sparse/handwritten layout
     results = [pytesseract.image_to_string(img, config=c) for c in [cfg3, cfg6, cfg11]]
-    # Score by clean printable ASCII — raw length is inflated by OCR garbage symbols
-    def _score(t):
-        return sum(1 for c in t if c.isascii() and (c.isalnum() or c in ' \n.,:-#/'))
-    return max(results, key=_score)
+    return max(results, key=_ascii_score)
 
-
-def extract_text_from_pdf(filepath):
-    import fitz
-    import pytesseract
-    from PIL import Image
-    import io
-
-    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
-    doc = fitz.open(filepath)
-    full_text = ""
-    for page_num in range(min(3, len(doc))):
-        page = doc[page_num]
-        native = page.get_text().strip()
-        mat = fitz.Matrix(3.0, 3.0)
-        pix = page.get_pixmap(matrix=mat)
-        img = Image.open(io.BytesIO(pix.tobytes("png")))
-        img = preprocess_for_ocr(img)
-        ocr = ocr_image(img, pytesseract)
-        # Always combine both — native text has printed labels,
-        # OCR captures the handwritten values; we need both
-        full_text += native + "\n" + ocr + "\n"
-    doc.close()
-    return full_text
 
 
 def find_sbl(text):
@@ -172,9 +155,9 @@ def find_sbl(text):
     # Format 2: SECTION ___ BLOCK ___ LOT(S) ___ on a handwritten form.
     # Find each field independently. Allow "-" as decimal (OCR misreads "." as "-").
     # Use loose boundary before block/lot since OCR often merges adjacent chars.
-    sec_m = re.search(r'\bsection\b[^\d\n]{0,25}(\d{1,3}(?:[.,\- ]\d{1,3})?)', text, re.IGNORECASE)
-    blk_m = re.search(r'(?:bl?|l)ock[^\d\n]{0,20}(\d{1,3})',                    text, re.IGNORECASE)
-    lot_m = re.search(r'lot[^\d\n]{0,20}(\d{1,3})',                              text, re.IGNORECASE)
+    sec_m = re.search(r'\b(?:section|sec)\.?\s*[^\d\n]{0,20}(\d{1,3}(?:[.,\- ]\d{1,3})?)', text, re.IGNORECASE)
+    blk_m = re.search(r'\b(?:block|blk)\.?\s*[^\d\n]{0,20}(\d{1,3})',                      text, re.IGNORECASE)
+    lot_m = re.search(r'\blot[^\d\n]{0,20}(\d{1,3})',                                       text, re.IGNORECASE)
 
     if sec_m and blk_m and lot_m:
         section = re.sub(r'[\-,\s]', '.', sec_m.group(1).strip())
@@ -196,6 +179,9 @@ def find_permit_number(text, blocked_digits=None):
     patterns = [
         r'permit\s*(?:no?|number|#|num)[^\d\n]{0,15}(\d[\d /\-]{0,12}\d)',
         r'permit\s*(?:no?|number|#|num)[^\d\n]{0,15}(\d+)',
+        # Orange folder label: "BLDG. PER No. __________"
+        r'bldg\.?\s*per(?:mit)?\.?\s*(?:no?|number|#|num)?\.?[^\d\n]{0,10}(\d[\d /\-]{0,12}\d)',
+        r'bldg\.?\s*per(?:mit)?\.?\s*(?:no?|number|#|num)?\.?[^\d\n]{0,10}(\d+)',
     ]
     for pattern in patterns:
         for m in re.finditer(pattern, text, re.IGNORECASE):
@@ -295,7 +281,7 @@ def save_claude_key(key):
     with open(CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
 
-def extract_fields_with_claude(page_png_bytes, api_key, app_no=""):
+def extract_fields_with_claude(page_png_bytes, api_key, app_no="", model="claude-haiku-4-5-20251001"):
     import anthropic, base64
     client = anthropic.Anthropic(api_key=api_key)
     img_b64 = base64.standard_b64encode(page_png_bytes).decode()
@@ -309,17 +295,23 @@ def extract_fields_with_claude(page_png_bytes, api_key, app_no=""):
     prompt = (
         "This is a building permit form from the Town of Yorktown. "
         "Forms may be fully printed, fully handwritten, or mixed. Extract ONLY these fields:\n"
-        "- permit_id: ONLY the value from the field labeled 'Permit No.', 'Permit #', or 'Building Permit No.' "
+        "- permit_id: ONLY the value from the field labeled 'Permit No.', 'Permit #', 'Building Permit No.', "
+        "or 'BLDG. PER No.' (orange folder cover sheets). "
+        "On Application for Building Permit forms, 'PERMIT No.' appears directly BELOW 'APPLICATION No.' — "
+        "read ONLY the 'PERMIT No.' line; ignore 'APPLICATION No.' entirely. "
         + app_no_hint +
         "If the Permit No. field is blank or absent, return empty string. "
         "Permit IDs are 8 digits, sometimes followed by a type suffix with no space (e.g. '20100027DEMO'). "
         "Return the digits and suffix together, no hyphens — e.g. '20100240' or '20100027DEMO'\n"
         "- address: the job site address — where the construction work is being performed. "
-        "On printed Building Permits this is labeled 'Location:' and appears mid-form after the permit number. "
-        "On application forms it may be labeled 'Location of Work', 'Job Address', or 'Site Address'. "
+        "On printed Building Permits this is labeled 'Location:'. "
+        "On Application for Building Permit forms, the label is 'ADDRESS/LOCATION OF PROPERTY' — "
+        "that is the correct field. Do NOT return the value from 'Present Address of Owner', "
+        "which appears above it on the same form and is the owner's home address (may differ from the job site). "
+        "On orange folder cover sheets the label is 'LOCATION OF PROJECT'. "
         "IMPORTANT: the form header always starts with 'Town of Yorktown / 363 Underhill Avenue / Yorktown Heights' — "
         "that is the Building Department's address, NOT the job site. Never return '363 Underhill Avenue'. "
-        "Also do not return the owner's mailing address even if it appears nearby.\n"
+        "If the address field says 'as above' or is blank, return empty string.\n"
         "- section: number from the SECTION or SBL SECTION field\n"
         "- block: number from the BLOCK field\n"
         "- lot: number from the LOT or LOT(S) field\n\n"
@@ -327,7 +319,7 @@ def extract_fields_with_claude(page_png_bytes, api_key, app_no=""):
         'Example: {"permit_id":"20100240","address":"1005 East Main St","section":"16.10","block":"4","lot":"25"}'
     )
     response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model=model,
         max_tokens=150,
         messages=[{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
@@ -410,6 +402,8 @@ class App(tk.Tk):
         # Each entry: {"current": path_in_staging, "renamed": False}
         self.staged = []
         self._scanning = False
+        self._src_labels = {}
+        self._current_sources = {"permit": "", "address": "", "sbl": ""}
 
         # Per-folder active toggles
         self.folder_active = {folder: tk.BooleanVar(value=True) for folder in SCAN_FOLDERS}
@@ -418,6 +412,7 @@ class App(tk.Tk):
 
         self._build_ui()
         self._start_watchers()
+        self._recover_staging()
 
         for v in (self.permit_id, self.street_num, self.street_name):
             v.trace_add("write", lambda *_: self._refresh_path())
@@ -432,23 +427,32 @@ class App(tk.Tk):
 
         ttk.Label(info, text="Permit ID").grid(row=0, column=0, sticky="w", pady=2)
         ttk.Entry(info, textvariable=self.permit_id, width=30).grid(row=0, column=1, padx=8, pady=2)
+        self._src_labels["permit"] = tk.Label(info, text="", font=("Consolas", 8), width=12, anchor="w", relief="flat", bd=0)
+        self._src_labels["permit"].grid(row=0, column=2, sticky="w")
 
         ttk.Label(info, text="Street Number").grid(row=1, column=0, sticky="w", pady=2)
         ttk.Entry(info, textvariable=self.street_num, width=10).grid(row=1, column=1, padx=8, pady=2, sticky="w")
 
         ttk.Label(info, text="Street Name").grid(row=2, column=0, sticky="w", pady=2)
         ttk.Entry(info, textvariable=self.street_name, width=30).grid(row=2, column=1, padx=8, pady=2)
+        self._src_labels["address"] = tk.Label(info, text="", font=("Consolas", 8), width=12, anchor="w", relief="flat", bd=0)
+        self._src_labels["address"].grid(row=2, column=2, sticky="w")
 
         ttk.Label(info, text="SBL").grid(row=3, column=0, sticky="w", pady=2)
         sbl_frame = ttk.Frame(info)
         sbl_frame.grid(row=3, column=1, padx=8, pady=2, sticky="w")
         ttk.Entry(sbl_frame, textvariable=self.sbl, width=18).pack(side="left")
         ttk.Button(sbl_frame, text="Copy", width=5, command=self._copy_sbl).pack(side="left", padx=(4, 0))
+        self._src_labels["sbl"] = tk.Label(info, text="", font=("Consolas", 8), width=12, anchor="w", relief="flat", bd=0)
+        self._src_labels["sbl"].grid(row=3, column=2, sticky="w")
 
         sf = ttk.Frame(info)
-        sf.grid(row=4, column=0, columnspan=2, pady=(10, 2))
+        sf.grid(row=4, column=0, columnspan=3, pady=(10, 2))
         ttk.Radiobutton(sf, text="OPEN",   variable=self.status_var, value="OPEN").pack(side="left", padx=20)
         ttk.Radiobutton(sf, text="CLOSED", variable=self.status_var, value="CLOSED").pack(side="left", padx=20)
+
+        self._form_lbl = ttk.Label(info, text="", font=("Segoe UI", 8))
+        self._form_lbl.grid(row=5, column=0, columnspan=3, pady=(2, 0))
 
         pf = ttk.LabelFrame(self, text="Laserfiche Navigation", padding=10)
         pf.grid(row=1, column=0, **p, sticky="ew")
@@ -478,10 +482,21 @@ class App(tk.Tk):
 
         lf = ttk.LabelFrame(self, text="File Activity", padding=10)
         lf.grid(row=3, column=0, **p, sticky="ew")
+        ttk.Label(lf, text="Place official Building Permit face-down on top before scanning.",
+                  font=("Segoe UI", 8), foreground="#888888").grid(row=0, column=0, sticky="w", pady=(0, 4))
         self.log_box = tk.Text(lf, height=8, width=50, state="disabled",
                                font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4",
                                relief="flat", cursor="arrow")
-        self.log_box.grid()
+        self.log_box.grid(row=1, column=0)
+
+        prog_row = ttk.Frame(lf)
+        prog_row.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        self.progress_var = tk.DoubleVar(value=0)
+        self.progress_bar = ttk.Progressbar(prog_row, variable=self.progress_var,
+                                            maximum=100, mode="determinate", length=370)
+        self.progress_bar.pack(side="left", fill="x", expand=True)
+        self.progress_pct = ttk.Label(prog_row, text="", font=("Consolas", 8), width=5, anchor="e")
+        self.progress_pct.pack(side="left", padx=(6, 0))
 
         bf = ttk.Frame(self)
         bf.grid(row=4, column=0, **p)
@@ -580,7 +595,9 @@ class App(tk.Tk):
         """Run full extraction on a PDF. Returns (permit, num, street, sbl). Safe to call from any thread."""
         import fitz
         doc = fitz.open(path)
-        num_pages = min(6, len(doc))
+        num_pages = min(3, len(doc))
+
+        self.after(0, self._set_progress, 5)
 
         # Pass 1: native text page detection (instant for digital PDFs)
         official_idx = None
@@ -592,12 +609,16 @@ class App(tk.Tk):
             elif ptype == "application" and application_idx is None:
                 application_idx = i
 
+        self.after(0, self._set_progress, 20)
+
         # Pass 2: if official permit not yet found, OCR-scan pages to look for it.
         # Runs even when application was found in Pass 1 — official always wins.
+        _ocr_pct = [40, 60, 75]
         if official_idx is None:
             self.after(0, self._log, "[..] No official permit in native text — scanning pages with OCR...")
             for i in range(num_pages):
                 ptype = detect_permit_type(extract_text_from_page(doc, i))
+                self.after(0, self._set_progress, _ocr_pct[i])
                 if ptype == "official":
                     official_idx = i
                     break
@@ -607,7 +628,10 @@ class App(tk.Tk):
         if official_idx is not None:
             target, permit_type = official_idx, "official"
         elif application_idx is not None:
-            target, permit_type = application_idx, "application"
+            # Application forms are staged for filing but not used as a data source
+            self.after(0, self._log, "[--] Application form detected — staged for filing, not used as data source")
+            doc.close()
+            return "", "", "", "", {"permit": "", "address": "", "sbl": "", "form_type": "application", "form_page": application_idx + 1}
         else:
             target, permit_type = 0, "unknown"
 
@@ -631,30 +655,52 @@ class App(tk.Tk):
         address = find_address(text)
         sbl     = find_sbl(text)
 
-        # Claude fills whatever text extraction missed
-        if not (permit and address and sbl):
+        sources     = {"permit": "", "address": "", "sbl": "", "form_type": permit_type, "form_page": target + 1}
+        # Handwritten forms: Tesseract regex is unreliable on handwriting — rank below Claude
+        if permit_type in ("application", "unknown"):
+            text_source = "tesseract_hw"
+        else:
+            text_source = "native" if len(native_text.strip()) > 80 else "tesseract"
+        if permit:  sources["permit"]  = text_source
+        if address: sources["address"] = text_source
+        if sbl:     sources["sbl"]     = text_source
+
+        # Claude fills missing fields; for the orange folder (unknown) it also overrides tesseract_hw
+        handwritten = permit_type == "unknown"
+        if not (permit and address and sbl) or handwritten:
             api_key = load_claude_key()
             if api_key:
                 try:
                     missing = [n for n, v in [("permit", permit), ("address", address), ("sbl", sbl)] if not v]
+                    self.after(0, self._set_progress, 85)
                     self.after(0, self._log, f"[..] Sending to Claude (missing: {', '.join(missing)})...")
-                    pix = doc[target].get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
-                    cl_permit, cl_address, cl_sbl = extract_fields_with_claude(pix.tobytes("png"), api_key, app_no=app_no)
+                    # Handwritten forms need higher zoom + a stronger model to read reliably
+                    zoom  = 3.0 if handwritten else 2.0
+                    cl_model = "claude-sonnet-4-6" if handwritten else "claude-haiku-4-5-20251001"
+                    pix = doc[target].get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                    cl_permit, cl_address, cl_sbl = extract_fields_with_claude(
+                        pix.tobytes("png"), api_key, app_no=app_no, model=cl_model)
                     self.after(0, self._log, f"[..] Claude returned permit='{cl_permit}' address='{cl_address}' sbl='{cl_sbl}'")
                     cl_permit_digits = re.sub(r'\D', '', cl_permit)
-                    if not permit and cl_permit and '-' not in cl_permit and len(cl_permit_digits) == 8:
+                    permit_slot_open = not permit or (handwritten and sources["permit"] == "tesseract_hw")
+                    if permit_slot_open and cl_permit and '-' not in cl_permit and len(cl_permit_digits) == 8:
                         if app_no_digits and cl_permit_digits == app_no_digits:
                             self.after(0, self._log, f"[!]  Claude returned application number ({cl_permit}) — discarding")
                         else:
                             permit = cl_permit
-                    if not address and cl_address:
+                            sources["permit"] = "claude"
+                    addr_slot_open = not address or (handwritten and sources["address"] == "tesseract_hw")
+                    if addr_slot_open and cl_address:
                         cl_address = re.sub(r',?\s*(Yorktown|New York|NY|\d{5}).*$', '', cl_address, flags=re.IGNORECASE).strip()
                         suffix_m = re.search(rf'\b({STREET_SUFFIXES})\b\.?', cl_address, re.IGNORECASE)
                         if suffix_m:
                             cl_address = cl_address[:suffix_m.end()].strip().rstrip(',.')
                         address = cl_address
-                    if not sbl and cl_sbl:
+                        sources["address"] = "claude"
+                    sbl_slot_open = not sbl or (handwritten and sources["sbl"] == "tesseract_hw")
+                    if sbl_slot_open and cl_sbl:
                         sbl = cl_sbl
+                        sources["sbl"] = "claude"
                 except Exception as e:
                     self.after(0, self._log, f"[!]  Claude error: {e}")
 
@@ -665,39 +711,78 @@ class App(tk.Tk):
             if corrected != street:
                 self.after(0, self._log, f"[..] Street corrected: '{street}' → '{corrected}'")
             street = corrected
-        return permit, num, street, sbl
+        return permit, num, street, sbl, sources
 
     def _ocr_and_fill(self, path):
         try:
-            permit, num, street, sbl = self._extract_fields(path)
-            self.after(0, self._apply_extracted, permit, num, street, sbl)
+            permit, num, street, sbl, sources = self._extract_fields(path)
+            self.after(0, self._apply_extracted, permit, num, street, sbl, sources)
         except Exception as e:
             self.after(0, self._log, f"[!]  OCR error: {e}")
             self.after(0, lambda: self.confirm_btn.config(state="normal"))
 
-    def _apply_extracted(self, permit, num, street, sbl):
-        if permit:
+    def _update_src_label(self, field, source):
+        lbl = self._src_labels.get(field)
+        if not lbl:
+            return
+        text, color = _SRC_STYLE.get(source, ("", "#888888"))
+        lbl.config(text=text, fg=color)
+
+    def _apply_extracted(self, permit, num, street, sbl, sources=None):
+        self._set_progress(100)
+        sources = sources or {}
+
+        def _cur_rank(field):
+            return _SOURCE_RANK.get(self._current_sources.get(field, ""), 0)
+
+        def _new_rank(key):
+            return _SOURCE_RANK.get(sources.get(key, ""), 0)
+
+        # Only overwrite a field if the incoming source is strictly better, or the field is empty.
+        # Prevents a late-finishing OCR thread from clobbering better data already set.
+        permit_wins  = bool(permit)  and (_new_rank("permit")  > _cur_rank("permit")  or not self.permit_id.get().strip())
+        address_wins = bool(street)  and (_new_rank("address") > _cur_rank("address") or not self.street_name.get().strip())
+        sbl_wins     = bool(sbl)     and (_new_rank("sbl")     > _cur_rank("sbl")     or not self.sbl.get().strip())
+
+        _FORM_DISPLAY = {
+            "official":    ("Building Permit",    "#2e7d32"),
+            "application": ("Permit Application", "#e65100"),
+        }
+        form_type = sources.get("form_type", "")
+        form_page = sources.get("form_page", "")
+        if form_type in _FORM_DISPLAY:
+            label_text, color = _FORM_DISPLAY[form_type]
+            suffix = f"  ·  page {form_page}" if form_page else ""
+            self._form_lbl.config(text=label_text + suffix, foreground=color)
+
+        if permit_wins:
             self.permit_id.set(permit)
+            self._current_sources["permit"] = sources.get("permit", "")
+            self._update_src_label("permit", sources.get("permit", ""))
             self._log(f"[OK] Permit ID: {permit}")
-        else:
+        elif not self.permit_id.get().strip():
             self._log("[!]  Permit ID not found — enter manually")
 
-        if num and street:
+        if address_wins:
             self.street_num.set(num)
             self.street_name.set(street)
-            self._log(f"[OK] Address: {num} {street}")
-        elif street:
-            self.street_name.set(street)
-            self._log(f"[?]  Address found (check number): {street}")
-        else:
+            self._current_sources["address"] = sources.get("address", "")
+            self._update_src_label("address", sources.get("address", ""))
+            if num:
+                self._log(f"[OK] Address: {num} {street}")
+            else:
+                self._log(f"[?]  Address found (check number): {street}")
+        elif not self.street_name.get().strip():
             self._log("[!]  Address not found — enter manually")
 
         self._copy_path()
 
-        if sbl:
+        if sbl_wins:
             self.sbl.set(sbl)
+            self._current_sources["sbl"] = sources.get("sbl", "")
+            self._update_src_label("sbl", sources.get("sbl", ""))
             self._log(f"[OK] SBL: {sbl}  (click Copy when ready)")
-        else:
+        elif not self.sbl.get().strip():
             self._log("[!]  SBL not found — enter manually")
 
         self.confirm_btn.config(state="normal")
@@ -716,7 +801,7 @@ class App(tk.Tk):
 
         unrenamed = [e for e in self.staged if not e["renamed"]]
         sorted_entries = sorted(unrenamed,
-                                key=lambda e: os.path.getmtime(e["current"]) if os.path.exists(e["current"]) else 0,
+                                key=lambda e: os.path.getctime(e["current"]) if os.path.exists(e["current"]) else 0,
                                 reverse=True)
 
         for i, entry in enumerate(sorted_entries):
@@ -771,6 +856,11 @@ class App(tk.Tk):
         self.log_box.delete("1.0", "end")
         self.log_box.config(state="disabled")
         self.path_label.config(text="Fill in street info above", foreground="gray")
+        self._set_progress(0)
+        for lbl in self._src_labels.values():
+            lbl.config(text="")
+        self._form_lbl.config(text="")
+        self._current_sources = {"permit": "", "address": "", "sbl": ""}
 
     def _open_staging(self):
         subprocess.Popen(["explorer", STAGING_FOLDER])
@@ -840,6 +930,19 @@ class App(tk.Tk):
         ttk.Button(win, text="Save", command=_save).pack(pady=(4, 16))
         win.wait_window()
 
+    def _recover_staging(self):
+        if not os.path.exists(STAGING_FOLDER):
+            return
+        pdfs = [os.path.join(STAGING_FOLDER, f) for f in os.listdir(STAGING_FOLDER)
+                if f.lower().endswith(".pdf")]
+        for p in pdfs:
+            if not any(e["current"] == p for e in self.staged):
+                self.staged.append({"current": p, "renamed": False})
+                self._log(f"[..] Recovered: {os.path.basename(p)}")
+        if pdfs:
+            self.confirm_btn.config(state="normal")
+            self._log(f"[--] {len(pdfs)} file(s) found in staging from previous session")
+
     def _reocr_staging(self):
         if self._scanning:
             self._log("[--] Scan already in progress — please wait")
@@ -858,52 +961,151 @@ class App(tk.Tk):
                 self.staged.append({"current": p, "renamed": False})
                 self._log(f"[..] Registered: {os.path.basename(p)}")
         self._scanning = True
-        self._log(f"[..] Re-OCR: scanning {len(pdfs)} file(s), oldest first...")
+        self._log(f"[..] Re-OCR: classifying and scanning {len(pdfs)} file(s)...")
         threading.Thread(target=self._reocr_scan_loop, args=(pdfs,), daemon=True).start()
 
-    def _reocr_scan_loop(self, pdfs):
-        best_permit = ""
-        best_num    = ""
-        best_street = ""
-        best_sbl    = ""
+    def _classify_file(self, path) -> str:
+        """Detect form type via native text then fast single-pass OCR. No field extraction."""
+        try:
+            import pytesseract
+            pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+        except Exception:
+            pass
+        try:
+            doc = fitz.open(path)
+            num_pages = min(3, len(doc))
+            fallback = "unknown"
+            # Native text pass — instant for digital PDFs
+            for i in range(num_pages):
+                pt = detect_permit_type(doc[i].get_text())
+                if pt == "official":
+                    doc.close()
+                    return "official"
+                elif pt == "application":
+                    fallback = "application"
+            if fallback == "application":
+                doc.close()
+                return "application"
+            # Quick single-pass OCR — cheaper than full dual-pass used during extraction
+            for i in range(num_pages):
+                pix  = doc[i].get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+                gray = Image.frombytes("RGB", [pix.width, pix.height], pix.samples).convert("L")
+                try:
+                    text = pytesseract.image_to_string(gray, config="--psm 3 --oem 3")
+                    pt = detect_permit_type(text)
+                    if pt == "official":
+                        doc.close()
+                        return "official"
+                    elif pt == "application":
+                        fallback = "application"
+                except Exception:
+                    pass
+            doc.close()
+            return fallback
+        except Exception:
+            return "unknown"
 
+    def _reocr_scan_loop(self, pdfs):
+        """Two-phase cascade: classify all files first, then extract in priority order.
+
+        Priority: official Building Permit → Permit Application → orange folder / other.
+        Between tiers, stop early if all three fields (permit, address, SBL) are already satisfied.
+        Within each tier, source rank governs which result wins when multiple files contribute.
+        """
+        _TIER_LABEL = {
+            "official":    "Building Permit",
+            "application": "Permit Application",
+            "unknown":     "folder / other",
+        }
+
+        # ── Phase 1: Classify ──────────────────────────────────────────────────
+        self.after(0, self._log, f"[..] Classifying {len(pdfs)} file(s)...")
+        buckets: dict[str, list] = {"official": [], "application": [], "unknown": []}
         for path in pdfs:
-            self.after(0, self._log, f"[..] Trying: {os.path.basename(path)}")
-            try:
-                permit, num, street, sbl = self._extract_fields(path)
-                updates = []
-                if permit and not best_permit:
-                    best_permit = permit
-                    updates.append(f"permit={permit}")
-                # num and street are always updated as a pair — never mix from different files.
-                # Prefer the address with the longer street number (more digits = more complete).
-                if street and (not best_street or len(num) > len(best_num)):
-                    best_num    = num
-                    best_street = street
-                    updates.append(f"address={num} {street}")
-                if sbl and not best_sbl:
-                    best_sbl = sbl
-                    updates.append(f"sbl={sbl}")
-                if updates:
-                    self.after(0, self._log, f"[..] Got from {os.path.basename(path)}: {', '.join(updates)}")
-                else:
-                    self.after(0, self._log, f"[--] Nothing new in {os.path.basename(path)}")
-            except Exception as e:
-                self.after(0, self._log, f"[!]  Error on {os.path.basename(path)}: {e}")
+            ft = self._classify_file(path)
+            buckets[ft].append(path)
+            self.after(0, self._log, f"[..] {os.path.basename(path)} → {_TIER_LABEL[ft]}")
+
+        # Application forms are staged for filing but not used as a data source
+        for path in buckets["application"]:
+            self.after(0, self._log, f"[--] {os.path.basename(path)} — application form, skipped as data source")
+
+        # ── Phase 2: Extract in tier order — official first, orange folder fills gaps ──
+        best_permit = "";  best_permit_rank = 0
+        best_num    = "";  best_street = "";  best_addr_rank = 0
+        best_sbl    = "";  best_sbl_rank  = 0
+        best_sources = {"permit": "", "address": "", "sbl": ""}
+
+        for tier in ("official", "unknown"):
+            if not buckets[tier]:
+                continue
+
+            missing = [n for n, v in [("permit", best_permit),
+                                       ("address", best_street),
+                                       ("sbl",     best_sbl)] if not v]
+            if not missing:
+                self.after(0, self._log, f"[OK] All fields complete — skipping {_TIER_LABEL[tier]} tier")
+                break
+
+            self.after(0, self._log,
+                       f"[..] {_TIER_LABEL[tier]} tier — looking for: {', '.join(missing)}")
+
+            for path in buckets[tier]:
+                still_missing = [n for n, v in [("permit", best_permit),
+                                                  ("address", best_street),
+                                                  ("sbl",     best_sbl)] if not v]
+                if not still_missing:
+                    break  # all done within this tier
+
+                self.after(0, self._log, f"[..] Trying: {os.path.basename(path)}")
+                try:
+                    permit, num, street, sbl, sources = self._extract_fields(path)
+                    updates = []
+
+                    permit_rank = _SOURCE_RANK.get(sources["permit"], 0)
+                    if permit and permit_rank > best_permit_rank:
+                        best_permit = permit; best_permit_rank = permit_rank
+                        best_sources["permit"] = sources["permit"]
+                        updates.append(f"permit={permit}")
+
+                    addr_rank = _SOURCE_RANK.get(sources["address"], 0)
+                    if street and (not best_street or addr_rank > best_addr_rank or
+                                   (addr_rank == best_addr_rank and len(num) > len(best_num))):
+                        best_num = num; best_street = street; best_addr_rank = addr_rank
+                        best_sources["address"] = sources["address"]
+                        updates.append(f"address={num} {street}")
+
+                    sbl_rank = _SOURCE_RANK.get(sources["sbl"], 0)
+                    if sbl and sbl_rank > best_sbl_rank:
+                        best_sbl = sbl; best_sbl_rank = sbl_rank
+                        best_sources["sbl"] = sources["sbl"]
+                        updates.append(f"sbl={sbl}")
+
+                    if updates:
+                        self.after(0, self._log, f"[..] Got: {', '.join(updates)}")
+                    else:
+                        self.after(0, self._log, f"[--] Nothing new from {os.path.basename(path)}")
+                except Exception as e:
+                    self.after(0, self._log, f"[!]  Error on {os.path.basename(path)}: {e}")
 
         if best_permit or best_street or best_sbl:
-            self.after(0, self._apply_extracted, best_permit, best_num, best_street, best_sbl)
+            self.after(0, self._apply_extracted,
+                       best_permit, best_num, best_street, best_sbl, best_sources)
         else:
-            self.after(0, self._log, "[!]  No data found in any staging file — fill manually")
+            self.after(0, self._log, "[!]  No data found in any staged file — fill manually")
             self.after(0, lambda: self.confirm_btn.config(state="normal"))
         self._scanning = False
+
+    def _set_progress(self, pct):
+        self.progress_var.set(pct)
+        self.progress_pct.config(text=f"{int(pct)}%" if pct > 0 else "")
 
     def _log(self, msg):
         self.log_box.config(state="normal")
         self.log_box.insert("end", msg + "\n")
         self.log_box.see("end")
         self.log_box.config(state="disabled")
-        with open(r"C:\Users\nkhoury\permit_scan_debug.log", "a", encoding="utf-8") as _f:
+        with open(DEBUG_LOG, "a", encoding="utf-8") as _f:
             _f.write(msg + "\n")
 
     # ── Watchers ──────────────────────────────────────────────────────────────
