@@ -5,7 +5,7 @@ import threading
 import time
 import re
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import shutil
@@ -47,7 +47,7 @@ def fuzzy_match_street(street_name):
     import difflib
     if not KNOWN_STREETS or not street_name:
         return street_name
-    hits = difflib.get_close_matches(street_name.upper(), KNOWN_STREETS, n=1, cutoff=0.8)
+    hits = difflib.get_close_matches(street_name.upper(), KNOWN_STREETS, n=1, cutoff=0.9)
     return hits[0] if hits else street_name
 
 STREET_SUFFIXES = (
@@ -416,6 +416,9 @@ class App(tk.Tk):
 
         for v in (self.permit_id, self.street_num, self.street_name):
             v.trace_add("write", lambda *_: self._refresh_path())
+        self.sbl.trace_add("write", lambda *_: self._validate_sbl())
+        self.bind("<Key>", self._on_hotkey)
+        self.after(100, self._update_stats)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -441,8 +444,10 @@ class App(tk.Tk):
         ttk.Label(info, text="SBL").grid(row=3, column=0, sticky="w", pady=2)
         sbl_frame = ttk.Frame(info)
         sbl_frame.grid(row=3, column=1, padx=8, pady=2, sticky="w")
-        ttk.Entry(sbl_frame, textvariable=self.sbl, width=18).pack(side="left")
+        self._sbl_entry = ttk.Entry(sbl_frame, textvariable=self.sbl, width=18)
+        self._sbl_entry.pack(side="left")
         ttk.Button(sbl_frame, text="Copy", width=5, command=self._copy_sbl).pack(side="left", padx=(4, 0))
+        ttk.Style().configure("SBLInvalid.TEntry", foreground="#c62828")
         self._src_labels["sbl"] = tk.Label(info, text="", font=("Consolas", 8), width=12, anchor="w", relief="flat", bd=0)
         self._src_labels["sbl"].grid(row=3, column=2, sticky="w")
 
@@ -483,17 +488,28 @@ class App(tk.Tk):
         lf = ttk.LabelFrame(self, text="File Activity", padding=10)
         lf.grid(row=3, column=0, **p, sticky="ew")
         ttk.Label(lf, text="Place official Building Permit face-down on top before scanning.",
-                  font=("Segoe UI", 8), foreground="#888888").grid(row=0, column=0, sticky="w", pady=(0, 4))
-        self.log_box = tk.Text(lf, height=8, width=50, state="disabled",
+                  font=("Segoe UI", 8), foreground="#888888").grid(
+                  row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        self.log_box = tk.Text(lf, height=5, width=34, state="disabled",
                                font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4",
                                relief="flat", cursor="arrow")
-        self.log_box.grid(row=1, column=0)
+        self.log_box.grid(row=1, column=0, sticky="nsew")
+
+        # Live page preview — updated as each page is rendered during OCR
+        prev_frame = tk.Frame(lf, bg="#1e1e1e", width=115, height=155)
+        prev_frame.grid(row=1, column=1, padx=(8, 0), sticky="n")
+        prev_frame.grid_propagate(False)
+        self._preview_label = tk.Label(prev_frame, bg="#1e1e1e",
+                                       text="no\npreview", fg="#444444",
+                                       font=("Consolas", 8))
+        self._preview_label.place(relx=0.5, rely=0.5, anchor="center")
+        self._preview_photo = None
 
         prog_row = ttk.Frame(lf)
-        prog_row.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        prog_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.progress_var = tk.DoubleVar(value=0)
         self.progress_bar = ttk.Progressbar(prog_row, variable=self.progress_var,
-                                            maximum=100, mode="determinate", length=370)
+                                            maximum=100, mode="determinate", length=260)
         self.progress_bar.pack(side="left", fill="x", expand=True)
         self.progress_pct = ttk.Label(prog_row, text="", font=("Consolas", 8), width=5, anchor="e")
         self.progress_pct.pack(side="left", padx=(6, 0))
@@ -509,6 +525,11 @@ class App(tk.Tk):
         ttk.Button(bf, text="Show OCR",       command=self._show_ocr,      width=9).pack(side="left", padx=6)
         ttk.Button(bf, text="Re-OCR",         command=self._reocr_staging, width=8).pack(side="left", padx=6)
         ttk.Button(bf, text="API Key",        command=self._set_api_key,   width=8).pack(side="left", padx=6)
+
+        self._stats_var = tk.StringVar()
+        ttk.Label(self, textvariable=self._stats_var,
+                  font=("Segoe UI", 8), foreground="#888888").grid(
+                  row=5, column=0, pady=(0, 6))
 
     # ── Path helpers ──────────────────────────────────────────────────────────
 
@@ -551,6 +572,48 @@ class App(tk.Tk):
         if sbl:
             self.clipboard_clear()
             self.clipboard_append(sbl)
+
+    def _validate_sbl(self):
+        val = self.sbl.get().strip()
+        valid = not val or bool(re.match(r'^\d{1,3}\.\d{1,3}-\d{1,3}-\d{1,3}$', val))
+        self._sbl_entry.config(style="TEntry" if valid else "SBLInvalid.TEntry")
+
+    def _on_hotkey(self, event):
+        if isinstance(self.focus_get(), (ttk.Entry, tk.Entry, tk.Text)):
+            return
+        if event.keysym == "Return":
+            if self.confirm_btn["state"] == "normal":
+                self._confirm_rename()
+        elif event.char.lower() == "n":
+            self._new_permit()
+        elif event.char.lower() == "r":
+            self._reocr_staging()
+
+    def _update_stats(self):
+        history = load_history()
+        today    = datetime.now().strftime("%Y-%m-%d")
+        week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        today_n = sum(1 for e in history if e.get("date", "").startswith(today))
+        week_n  = sum(1 for e in history if e.get("date", "") >= week_ago)
+        self._stats_var.set(
+            f"Today: {today_n} permit{'s' if today_n != 1 else ''}   ·   Past 7 days: {week_n}"
+        )
+
+    def _update_preview(self, png_bytes):
+        from PIL import Image, ImageTk
+        import io
+        try:
+            img = Image.open(io.BytesIO(png_bytes))
+            img.thumbnail((115, 155), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            self._preview_photo = photo  # hold reference so GC doesn't collect it
+            self._preview_label.config(image=photo, text="")
+        except Exception:
+            pass
+
+    def _clear_preview(self):
+        self._preview_photo = None
+        self._preview_label.config(image="", text="no\npreview")
 
     # ── File handling ─────────────────────────────────────────────────────────
 
@@ -637,6 +700,15 @@ class App(tk.Tk):
 
         self.after(0, self._log, f"[..] Form type: {permit_type} (page {target + 1})")
 
+        # Push a quick 1.5× render of the target page to the preview panel
+        try:
+            import fitz as _fitz
+            _prev = doc[target].get_pixmap(matrix=_fitz.Matrix(1.5, 1.5))
+            self.after(0, self._update_preview, _prev.tobytes("png"))
+            del _prev
+        except Exception:
+            pass
+
         native_text = doc[target].get_text()
         if len(native_text.strip()) > 80:
             text = native_text
@@ -655,7 +727,12 @@ class App(tk.Tk):
         address = find_address(text)
         sbl     = find_sbl(text)
 
-        sources     = {"permit": "", "address": "", "sbl": "", "form_type": permit_type, "form_page": target + 1}
+        subtype = ""
+        if permit_type == "official":
+            sm = _OFFICIAL_PERMIT_TYPES.search(text.upper())
+            subtype = sm.group(0).title() if sm else "Building Permit"
+        sources = {"permit": "", "address": "", "sbl": "",
+                   "form_type": permit_type, "form_page": target + 1, "form_subtype": subtype}
         # Handwritten forms: Tesseract regex is unreliable on handwriting — rank below Claude
         if permit_type in ("application", "unknown"):
             text_source = "tesseract_hw"
@@ -744,16 +821,14 @@ class App(tk.Tk):
         address_wins = bool(street)  and (_new_rank("address") > _cur_rank("address") or not self.street_name.get().strip())
         sbl_wins     = bool(sbl)     and (_new_rank("sbl")     > _cur_rank("sbl")     or not self.sbl.get().strip())
 
-        _FORM_DISPLAY = {
-            "official":    ("Building Permit",    "#2e7d32"),
-            "application": ("Permit Application", "#e65100"),
-        }
         form_type = sources.get("form_type", "")
         form_page = sources.get("form_page", "")
-        if form_type in _FORM_DISPLAY:
-            label_text, color = _FORM_DISPLAY[form_type]
-            suffix = f"  ·  page {form_page}" if form_page else ""
-            self._form_lbl.config(text=label_text + suffix, foreground=color)
+        suffix = f"  ·  page {form_page}" if form_page else ""
+        if form_type == "official":
+            label_text = sources.get("form_subtype") or "Building Permit"
+            self._form_lbl.config(text=label_text + suffix, foreground="#2e7d32")
+        elif form_type == "application":
+            self._form_lbl.config(text="Permit Application" + suffix, foreground="#e65100")
 
         if permit_wins:
             self.permit_id.set(permit)
@@ -799,6 +874,16 @@ class App(tk.Tk):
             self._log("[!]  Enter a Permit ID before confirming")
             return
 
+        # Duplicate detection — warn if this permit ID appears in history
+        prior = [e for e in load_history() if e.get("permit_id", "").startswith(permit[:8])]
+        if prior:
+            last = prior[0]
+            if not messagebox.askyesno(
+                    "Duplicate Permit",
+                    f"Permit {permit} was already filed on {last['date']}.\n"
+                    f"Address on file: {last.get('address', '—')}\n\nFile it again?"):
+                return
+
         unrenamed = [e for e in self.staged if not e["renamed"]]
         sorted_entries = sorted(unrenamed,
                                 key=lambda e: os.path.getctime(e["current"]) if os.path.exists(e["current"]) else 0,
@@ -826,6 +911,7 @@ class App(tk.Tk):
                 pass
 
         append_history(permit, address, sbl)
+        self._update_stats()
         self.confirm_btn.config(state="disabled")
         self._log(f"[--] {len(sorted_entries)} file(s) renamed — drag from staging to Laserfiche")
 
@@ -846,6 +932,7 @@ class App(tk.Tk):
                     self._log(f"[!]  Could not delete {os.path.basename(src)}: {e}")
 
         self.staged.clear()
+        self._clear_preview()
         self.permit_id.set("")
         self.street_num.set("")
         self.street_name.set("")
@@ -884,32 +971,146 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         win.title("Scan History")
         win.resizable(True, True)
+        win.geometry("740x500")
+        win.minsize(520, 320)
+
+        # ── Search bar ──
+        top = ttk.Frame(win)
+        top.pack(fill="x", padx=8, pady=(8, 2))
+        ttk.Label(top, text="Search:").pack(side="left")
+        search_var = tk.StringVar()
+        search_entry = ttk.Entry(top, textvariable=search_var, width=34)
+        search_entry.pack(side="left", padx=(4, 0))
+        search_entry.focus()
+
+        # ── Treeview ──
+        mid = ttk.Frame(win)
+        mid.pack(fill="both", expand=True, padx=8, pady=4)
 
         cols    = ("date", "permit_id", "address", "sbl")
         headers = ("Date", "Permit ID", "Address", "SBL")
-        tree = ttk.Treeview(win, columns=cols, show="headings", height=20)
+        tree = ttk.Treeview(mid, columns=cols, show="headings",
+                            height=16, selectmode="extended")
+
+        _sort = {"col": None, "rev": False}
+
+        def _sort_by(col):
+            if _sort["col"] == col:
+                _sort["rev"] = not _sort["rev"]
+            else:
+                _sort["col"] = col
+                _sort["rev"] = False
+            for c, h in zip(cols, headers):
+                arrow = (" ▲" if not _sort["rev"] else " ▼") if c == _sort["col"] else ""
+                tree.heading(c, text=h + arrow)
+            _populate()
+
         for col, hdr in zip(cols, headers):
-            tree.heading(col, text=hdr)
-        tree.column("date",      width=120)
-        tree.column("permit_id", width=110)
-        tree.column("address",   width=200)
-        tree.column("sbl",       width=100)
+            tree.heading(col, text=hdr, command=lambda c=col: _sort_by(c))
+        tree.column("date",      width=130, minwidth=100, stretch=False)
+        tree.column("permit_id", width=110, minwidth=90,  stretch=False)
+        tree.column("address",   width=260, minwidth=150)
+        tree.column("sbl",       width=110, minwidth=80,  stretch=False)
 
-        for entry in history:
-            tree.insert("", "end", values=(
-                entry.get("date", ""), entry.get("permit_id", ""),
-                entry.get("address", ""), entry.get("sbl", ""),
-            ))
-
-        sb = ttk.Scrollbar(win, orient="vertical", command=tree.yview)
+        sb = ttk.Scrollbar(mid, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=sb.set)
-        tree.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
-        sb.grid(row=0, column=1, sticky="ns", pady=8)
-        win.columnconfigure(0, weight=1)
-        win.rowconfigure(0, weight=1)
+        tree.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+        mid.columnconfigure(0, weight=1)
+        mid.rowconfigure(0, weight=1)
 
-        if not history:
-            tree.insert("", "end", values=("No history yet", "", "", ""))
+        # ── Footer: status + buttons ──
+        foot = ttk.Frame(win)
+        foot.pack(fill="x", padx=8, pady=(2, 8))
+
+        status_var = tk.StringVar()
+        ttk.Label(foot, textvariable=status_var,
+                  font=("Segoe UI", 8), foreground="gray").pack(side="left")
+
+        def _load_entry(event=None):
+            sel = tree.selection()
+            if not sel:
+                return
+            vals = tree.item(sel[0], "values")
+            if not vals[1]:
+                return
+            num, street = split_address(vals[2]) if vals[2] else ("", "")
+            self.permit_id.set(vals[1])
+            self.street_num.set(num)
+            self.street_name.set(street)
+            self.sbl.set(vals[3])
+            self._current_sources = {"permit": "", "address": "", "sbl": ""}
+            for lbl in self._src_labels.values():
+                lbl.config(text="")
+            self._form_lbl.config(text="")
+            self._refresh_path()
+            win.destroy()
+
+        def _delete_selected():
+            sel = tree.selection()
+            if not sel:
+                return
+            keys = {(tree.item(i, "values")[0], tree.item(i, "values")[1])
+                    for i in sel if tree.item(i, "values")[1]}
+            if not keys:
+                return
+            n = len(keys)
+            if not messagebox.askyesno(
+                    "Delete Records",
+                    f"Delete {n} selected record{'s' if n > 1 else ''}?\nThis cannot be undone.",
+                    parent=win):
+                return
+            history[:] = [e for e in history
+                          if (e.get("date", ""), e.get("permit_id", "")) not in keys]
+            with open(HISTORY_FILE, "w") as f:
+                json.dump(history, f, indent=2)
+            _populate()
+
+        def _clear_all():
+            if not history:
+                return
+            n = len(history)
+            if not messagebox.askyesno(
+                    "Clear All History",
+                    f"Delete all {n} record{'s' if n != 1 else ''}?\nThis cannot be undone.",
+                    parent=win):
+                return
+            history.clear()
+            with open(HISTORY_FILE, "w") as f:
+                json.dump([], f)
+            _populate()
+
+        ttk.Button(foot, text="Clear All",       command=_clear_all      ).pack(side="right", padx=(4, 0))
+        ttk.Button(foot, text="Delete Selected", command=_delete_selected ).pack(side="right", padx=(4, 0))
+        ttk.Button(foot, text="Load Selected",   command=_load_entry      ).pack(side="right", padx=(4, 0))
+
+        # ── Population (called on search change, sort, and after delete) ──
+        def _populate():
+            q = search_var.get().strip().upper()
+            rows = [e for e in history
+                    if not q or any(q in str(e.get(k, "")).upper() for k in cols)]
+            if _sort["col"]:
+                rows.sort(key=lambda e: e.get(_sort["col"], ""), reverse=_sort["rev"])
+            tree.delete(*tree.get_children())
+            for entry in rows:
+                tree.insert("", "end", values=(
+                    entry.get("date", ""), entry.get("permit_id", ""),
+                    entry.get("address", ""), entry.get("sbl", ""),
+                ))
+            shown = len(rows)
+            total = len(history)
+            if total == 0:
+                status_var.set("No history yet")
+            elif q:
+                status_var.set(f"{shown} of {total} records match")
+            else:
+                status_var.set(f"{total} record{'s' if total != 1 else ''}")
+
+        search_var.trace_add("write", lambda *_: _populate())
+        _populate()
+
+        tree.bind("<Double-1>", _load_entry)
+        tree.bind("<Delete>",   lambda e: _delete_selected())
 
     def _set_api_key(self):
         current = load_claude_key()
@@ -961,8 +1162,14 @@ class App(tk.Tk):
                 self.staged.append({"current": p, "renamed": False})
                 self._log(f"[..] Registered: {os.path.basename(p)}")
         self._scanning = True
+        self._set_progress(0)
         self._log(f"[..] Re-OCR: classifying and scanning {len(pdfs)} file(s)...")
-        threading.Thread(target=self._reocr_scan_loop, args=(pdfs,), daemon=True).start()
+        def _run_reocr():
+            try:
+                self._reocr_scan_loop(pdfs)
+            finally:
+                self._scanning = False
+        threading.Thread(target=_run_reocr, daemon=True).start()
 
     def _classify_file(self, path) -> str:
         """Detect form type via native text then fast single-pass OCR. No field extraction."""
@@ -972,6 +1179,8 @@ class App(tk.Tk):
         except Exception:
             pass
         try:
+            import fitz
+            from PIL import Image
             doc = fitz.open(path)
             num_pages = min(3, len(doc))
             fallback = "unknown"
@@ -1034,6 +1243,7 @@ class App(tk.Tk):
         best_permit = "";  best_permit_rank = 0
         best_num    = "";  best_street = "";  best_addr_rank = 0
         best_sbl    = "";  best_sbl_rank  = 0
+        best_form_type = "";  best_form_page = 0
         best_sources = {"permit": "", "address": "", "sbl": ""}
 
         for tier in ("official", "unknown"):
@@ -1081,6 +1291,10 @@ class App(tk.Tk):
                         best_sources["sbl"] = sources["sbl"]
                         updates.append(f"sbl={sbl}")
 
+                    if not best_form_type:
+                        best_form_type = sources.get("form_type", "")
+                        best_form_page = sources.get("form_page", 0)
+
                     if updates:
                         self.after(0, self._log, f"[..] Got: {', '.join(updates)}")
                     else:
@@ -1088,13 +1302,14 @@ class App(tk.Tk):
                 except Exception as e:
                     self.after(0, self._log, f"[!]  Error on {os.path.basename(path)}: {e}")
 
+        best_sources["form_type"] = best_form_type
+        best_sources["form_page"] = best_form_page
         if best_permit or best_street or best_sbl:
             self.after(0, self._apply_extracted,
                        best_permit, best_num, best_street, best_sbl, best_sources)
         else:
             self.after(0, self._log, "[!]  No data found in any staged file — fill manually")
             self.after(0, lambda: self.confirm_btn.config(state="normal"))
-        self._scanning = False
 
     def _set_progress(self, pct):
         self.progress_var.set(pct)
