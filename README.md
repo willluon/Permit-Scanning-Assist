@@ -29,6 +29,32 @@ The staff member then drags the staged file into Laserfiche and pastes the pre-b
 | Orange Folder Cover Sheet (handwritten) | Label pattern match | Tesseract → Claude Sonnet at 3× zoom |
 | Application for Building Permit | Header text match | Staged for filing only — no field extraction |
 
+Permit subtype is detected and displayed in the UI (e.g. "Electrical Permit", "Demolition Permit") rather than a generic label.
+
+---
+
+## UI Features
+
+### Main Window
+- **Source labels** next to each field show how the value was found: `text` (native PDF), `ocr` (Tesseract), `ai ←verify` (Claude), `ocr?` (Tesseract on handwriting)
+- **SBL validator** — the SBL field turns red if the value doesn't match the Yorktown `##.##-#-##` format
+- **Live page preview** — a thumbnail of the PDF page currently being analyzed updates in real time as OCR runs
+- **Scan stats** — running count of permits processed today and over the past 7 days, shown at the bottom of the window
+- **Per-folder pause toggles** — ON/OFF buttons to temporarily stop watching a specific scan folder
+- **Keyboard shortcuts** — `Enter` to confirm & rename, `N` for New Permit, `R` for Re-OCR (suppressed while typing in fields)
+
+### History Window
+- Full scan history with **date, permit ID, address, and SBL**
+- **Live search** — filters across all columns as you type
+- **Sortable columns** — click any column header to sort ascending/descending
+- **Multi-select delete** — select one or more rows and delete with confirmation (`Delete` key or button)
+- **Clear All** — wipes the full history with confirmation
+- **Double-click or Load Selected** — loads a historical permit back into the main form (useful for rescans or corrections)
+- Record count shown in the status bar, updates when filtering
+
+### Safety
+- **Duplicate permit warning** — before renaming, checks history for the same permit ID and prompts staff if a match is found, showing the date and address it was previously filed under
+
 ---
 
 ## Tech Stack
@@ -37,9 +63,9 @@ The staff member then drags the staged file into Laserfiche and pastes the pre-b
 - **PyMuPDF (fitz)** — PDF rendering and native text extraction
 - **Tesseract OCR** — local OCR for printed and handwritten text
 - **Anthropic Claude API** — AI fallback for difficult or handwritten documents
-  - Haiku model for printed permits (fast, low cost)
-  - Sonnet model for handwritten orange folder sheets (higher accuracy on cursive/print mix)
-- **difflib** — fuzzy street name matching against `yorktown_streets.txt`
+  - `claude-haiku-4-5` for printed permits (fast, low cost — $1/$5 per MTok)
+  - `claude-sonnet-4-6` for handwritten orange folder sheets (higher accuracy — $3/$15 per MTok)
+- **difflib** — fuzzy street name matching against `yorktown_streets.txt` (cutoff 0.9)
 
 ---
 
@@ -50,8 +76,8 @@ The current workflow still requires a staff member to manually drag files into L
 ### Planned Integration Path
 
 **Phase 1 — Laserfiche REST API (in progress / research)**
-The Town's Laserfiche instance (`LFAPP.yorktown.local`) runs Laserfiche Cloud or self-hosted with a Web API Server. Once the API Server is confirmed available on the network, the tool will:
-- Authenticate to Laserfiche via the REST API using a service account
+The Town's Laserfiche instance (`LFAPP.yorktown.local`) runs self-hosted with a Web API Server component. Once IT installs the Web API Server and provides a service account, the tool will:
+- Authenticate to Laserfiche via the REST API using the service account
 - Create or verify the folder path (`TownOfYorktown\Building Department\Parcels\{letter}\{street}\{address}`) automatically
 - Upload the renamed PDF directly into the correct Laserfiche folder
 - Set metadata fields (Permit ID, SBL, Address) on the entry at upload time
@@ -79,10 +105,16 @@ Laserfiche is the Town's official records management system. Every building perm
 | Tesseract OCR (printed) | Done |
 | Claude AI fallback (printed) | Done |
 | Orange folder handwriting extraction | Done |
+| Permit subtype detection (Electrical, Demolition, etc.) | Done |
 | Laserfiche path calculation + clipboard | Done |
+| Duplicate permit warning | Done |
+| Scan history with search, sort, delete | Done |
+| Live page preview during OCR | Done |
+| Keyboard shortcuts | Done |
+| SBL format validation | Done |
+| Daily / weekly scan stats | Done |
 | Laserfiche REST API upload | Planned |
 | Auto-filing on high-confidence results | Planned |
-| Duplicate permit detection | Planned |
 
 ---
 
