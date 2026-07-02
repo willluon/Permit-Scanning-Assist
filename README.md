@@ -58,6 +58,12 @@ Permit subtype is detected and displayed in the UI (e.g. "Electrical Permit", "D
 - **Double-click or Load Selected** — loads a historical permit back into the main form (useful for rescans or corrections)
 - Record count shown in the status bar, updates when filtering
 
+### Search Archive (full-text)
+- Every scan's OCR/native text is kept in `permit_scan_archive.db` and indexed with SQLite FTS5 — nothing is thrown away after extraction
+- **Search window** matches against permit ID, address, SBL, *and the full scanned text* ("asbestos", "detached garage", a contractor name…) with live as-you-type results and snippets
+- Records are stamped at Confirm & Rename with the final filename, OPEN/CLOSED status, and Laserfiche path — so a search result tells you exactly where the document lives
+- **Copy LF Path** and **Load Into Form** buttons on each result; prior history was imported automatically on first run
+
 ### Safety
 - **Duplicate permit warning** — before renaming, checks history for the same permit ID and prompts staff if a match is found, showing the date and address it was previously filed under
 
@@ -119,6 +125,10 @@ Laserfiche is the Town's official records management system. Every building perm
 | Keyboard shortcuts | Done |
 | SBL format validation | Done |
 | Daily / weekly scan stats | Done |
+| County parcel data cross-validation (address ↔ SBL) | Done |
+| Full-text archive + search of every scan | Done |
+| OPEN/CLOSED status tracked in history | Done |
+| Laserfiche Import Agent zero-touch filing | Pending IT (Web API alternative) |
 | Laserfiche REST API upload | Planned |
 | Auto-filing on high-confidence results | Planned |
 

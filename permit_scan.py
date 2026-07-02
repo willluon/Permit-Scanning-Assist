@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 import os
+import sqlite3
 import threading
 import time
 import re
@@ -492,16 +493,184 @@ def load_history():
     return []
 
 
-def append_history(permit_id, address, sbl):
+def append_history(permit_id, address, sbl, status="OPEN"):
     history = load_history()
     history.insert(0, {
         "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "permit_id": permit_id,
         "address": address,
         "sbl": sbl,
+        "status": status,
     })
     with open(HISTORY_FILE, "w") as f:
         json.dump(history[:1000], f, indent=2)
+
+
+# ── Full-text scan archive ─────────────────────────────────────────────────────
+# Every scan's OCR/native text is kept in permit_scan_archive.db and indexed
+# with FTS5 — a searchable full-text record of every document ever scanned.
+# Rows are created at extraction time and stamped with the confirmed permit
+# metadata + final filename + Laserfiche path at Confirm & Rename.
+
+ARCHIVE_DB_FILE = os.path.join(_HOME, "permit_scan_archive.db")
+
+
+def _archive_now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def _archive_con():
+    con = sqlite3.connect(ARCHIVE_DB_FILE)
+    con.execute("""CREATE TABLE IF NOT EXISTS scans (
+        id INTEGER PRIMARY KEY,
+        scanned_at   TEXT,
+        confirmed_at TEXT,
+        orig_name    TEXT,
+        final_name   TEXT,
+        permit_id    TEXT DEFAULT '',
+        address      TEXT DEFAULT '',
+        sbl          TEXT DEFAULT '',
+        status       TEXT DEFAULT '',
+        form_type    TEXT DEFAULT '',
+        lf_path      TEXT DEFAULT '',
+        text         TEXT DEFAULT '')""")
+    try:
+        con.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS scans_fts USING fts5(
+            permit_id, address, sbl, text, content='scans', content_rowid='id')""")
+        con.executescript("""
+            CREATE TRIGGER IF NOT EXISTS scans_ai AFTER INSERT ON scans BEGIN
+                INSERT INTO scans_fts(rowid, permit_id, address, sbl, text)
+                VALUES (new.id, new.permit_id, new.address, new.sbl, new.text);
+            END;
+            CREATE TRIGGER IF NOT EXISTS scans_ad AFTER DELETE ON scans BEGIN
+                INSERT INTO scans_fts(scans_fts, rowid, permit_id, address, sbl, text)
+                VALUES ('delete', old.id, old.permit_id, old.address, old.sbl, old.text);
+            END;
+            CREATE TRIGGER IF NOT EXISTS scans_au AFTER UPDATE ON scans BEGIN
+                INSERT INTO scans_fts(scans_fts, rowid, permit_id, address, sbl, text)
+                VALUES ('delete', old.id, old.permit_id, old.address, old.sbl, old.text);
+                INSERT INTO scans_fts(rowid, permit_id, address, sbl, text)
+                VALUES (new.id, new.permit_id, new.address, new.sbl, new.text);
+            END;""")
+    except sqlite3.OperationalError:
+        pass  # FTS5 unavailable — archive_search falls back to LIKE
+    return con
+
+
+def archive_record_scan(path, text, form_type):
+    """Insert or refresh the raw-text row for a scanned file (pre-confirmation)."""
+    con = _archive_con()
+    try:
+        name = os.path.basename(path)
+        row = con.execute("SELECT id FROM scans WHERE orig_name=? AND confirmed_at IS NULL",
+                          (name,)).fetchone()
+        if row:
+            con.execute("UPDATE scans SET text=?, form_type=?, scanned_at=? WHERE id=?",
+                        (text, form_type, _archive_now(), row[0]))
+        else:
+            con.execute("INSERT INTO scans (scanned_at, orig_name, form_type, text) VALUES (?,?,?,?)",
+                        (_archive_now(), name, form_type, text))
+        con.commit()
+    finally:
+        con.close()
+
+
+def archive_confirm(renamed_pairs, permit, address, sbl, status, lf_path):
+    """Stamp this batch's rows with confirmed metadata. renamed_pairs: [(orig_name, final_name)]."""
+    con = _archive_con()
+    try:
+        now = _archive_now()
+        for orig, final in renamed_pairs:
+            row = con.execute("SELECT id FROM scans WHERE orig_name=? AND confirmed_at IS NULL",
+                              (orig,)).fetchone()
+            if row:
+                con.execute("""UPDATE scans SET confirmed_at=?, final_name=?, permit_id=?,
+                               address=?, sbl=?, status=?, lf_path=? WHERE id=?""",
+                            (now, final, permit, address, sbl, status, lf_path, row[0]))
+            else:
+                # File staged without extraction (e.g. extra pages skipped by early exit)
+                con.execute("""INSERT INTO scans (scanned_at, confirmed_at, orig_name, final_name,
+                               permit_id, address, sbl, status, lf_path)
+                               VALUES (?,?,?,?,?,?,?,?,?)""",
+                            (now, now, orig, final, permit, address, sbl, status, lf_path))
+        con.commit()
+    finally:
+        con.close()
+
+
+def archive_search(query, limit=200):
+    """Search the archive. FTS5 (prefix-matching the last word) with LIKE fallback.
+    Returns rows: (id, scanned_at, permit_id, address, sbl, status, final_name, orig_name, snippet)."""
+    con = _archive_con()
+    try:
+        q = (query or "").strip()
+        base_cols = "id, scanned_at, permit_id, address, sbl, status, final_name, orig_name"
+        if not q:
+            return con.execute(f"""SELECT {base_cols}, substr(text, 1, 200) FROM scans
+                                   ORDER BY id DESC LIMIT ?""", (limit,)).fetchall()
+        toks = [t.replace('"', '') for t in q.split() if t.replace('"', '')]
+        if not toks:
+            return []
+        fts_q = ' '.join(f'"{t}"' for t in toks[:-1]) + f' "{toks[-1]}"*'
+        try:
+            return con.execute(f"""
+                SELECT s.id, s.scanned_at, s.permit_id, s.address, s.sbl, s.status,
+                       s.final_name, s.orig_name,
+                       snippet(scans_fts, 3, '»', '«', ' … ', 14)
+                FROM scans_fts JOIN scans s ON s.id = scans_fts.rowid
+                WHERE scans_fts MATCH ? ORDER BY rank LIMIT ?""",
+                (fts_q.strip(), limit)).fetchall()
+        except sqlite3.OperationalError:
+            like = f"%{q}%"
+            return con.execute(f"""SELECT {base_cols}, substr(text, 1, 200) FROM scans
+                                   WHERE text LIKE ? OR permit_id LIKE ? OR address LIKE ? OR sbl LIKE ?
+                                   ORDER BY id DESC LIMIT ?""",
+                               (like, like, like, like, limit)).fetchall()
+    finally:
+        con.close()
+
+
+def archive_get(row_id):
+    """Full record for the detail view. Returns a dict or None."""
+    con = _archive_con()
+    try:
+        row = con.execute("""SELECT scanned_at, confirmed_at, orig_name, final_name, permit_id,
+                             address, sbl, status, form_type, lf_path, text
+                             FROM scans WHERE id=?""", (row_id,)).fetchone()
+        if not row:
+            return None
+        keys = ("scanned_at", "confirmed_at", "orig_name", "final_name", "permit_id",
+                "address", "sbl", "status", "form_type", "lf_path", "text")
+        return dict(zip(keys, row))
+    finally:
+        con.close()
+
+
+def archive_count():
+    con = _archive_con()
+    try:
+        return con.execute("SELECT COUNT(*) FROM scans").fetchone()[0]
+    finally:
+        con.close()
+
+
+def archive_backfill_from_history():
+    """One-time import of pre-archive history entries (metadata only, no text)."""
+    con = _archive_con()
+    try:
+        if con.execute("SELECT COUNT(*) FROM scans").fetchone()[0]:
+            return 0
+        n = 0
+        for e in load_history():
+            con.execute("""INSERT INTO scans (scanned_at, confirmed_at, permit_id, address, sbl, status)
+                           VALUES (?,?,?,?,?,?)""",
+                        (e.get("date", ""), e.get("date", ""), e.get("permit_id", ""),
+                         e.get("address", ""), e.get("sbl", ""), e.get("status", "")))
+            n += 1
+        con.commit()
+        return n
+    finally:
+        con.close()
 
 
 # ── File watcher ───────────────────────────────────────────────────────────────
@@ -564,6 +733,16 @@ class App(tk.Tk):
         self.sbl.trace_add("write", lambda *_: self._validate_sbl())
         self.bind("<Key>", self._on_hotkey)
         self.after(100, self._update_stats)
+        self.after(150, self._init_archive)
+
+    def _init_archive(self):
+        try:
+            imported = archive_backfill_from_history()
+            if imported:
+                self._log(f"[--] Archive created — imported {imported} history record(s)")
+            self._log(f"[--] Archive: {archive_count()} scan(s) indexed")
+        except Exception as e:
+            self._log(f"[!]  Archive init failed: {e}")
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -668,6 +847,7 @@ class App(tk.Tk):
         ttk.Button(bf, text="New Permit",     command=self._new_permit,    width=12).pack(side="left", padx=6)
         ttk.Button(bf, text="Open Staging",   command=self._open_staging,  width=13).pack(side="left", padx=6)
         ttk.Button(bf, text="History",        command=self._show_history,  width=9).pack(side="left", padx=6)
+        ttk.Button(bf, text="Search",         command=self._show_archive,  width=8).pack(side="left", padx=6)
         ttk.Button(bf, text="Show OCR",       command=self._show_ocr,      width=9).pack(side="left", padx=6)
         ttk.Button(bf, text="Re-OCR",         command=self._reocr_staging, width=8).pack(side="left", padx=6)
         ttk.Button(bf, text="API Key",        command=self._set_api_key,   width=8).pack(side="left", padx=6)
@@ -809,6 +989,18 @@ class App(tk.Tk):
             self._log("[--]  Using current permit info")
             self.confirm_btn.config(state="normal")
 
+    def _archive_scan_text(self, doc, path, ocr_text, form_type):
+        """Store this file's text in the full-text archive. Native page text is free;
+        the OCR'd target-page text is prepended when it isn't already native."""
+        try:
+            pages = "\n\n".join(t for t in (doc[i].get_text() for i in range(len(doc))) if t.strip())
+            arch_text = pages
+            if ocr_text.strip() and ocr_text.strip() not in pages:
+                arch_text = (ocr_text + "\n\n" + pages).strip()
+            archive_record_scan(path, arch_text, form_type)
+        except Exception as e:
+            self.after(0, self._log, f"[!]  Archive write failed: {e}")
+
     def _extract_fields(self, path):
         """Run full extraction on a PDF. Returns (permit, num, street, sbl). Safe to call from any thread."""
         import fitz
@@ -848,6 +1040,7 @@ class App(tk.Tk):
         elif application_idx is not None:
             # Application forms are staged for filing but not used as a data source
             self.after(0, self._log, "[--] Application form detected — staged for filing, not used as data source")
+            self._archive_scan_text(doc, path, "", "application")
             doc.close()
             return "", "", "", "", {"permit": "", "address": "", "sbl": "", "form_type": "application", "form_page": application_idx + 1}
         else:
@@ -870,6 +1063,7 @@ class App(tk.Tk):
         else:
             text = extract_text_from_page(doc, target)
         self.last_ocr_text = text
+        self._archive_scan_text(doc, path, text, permit_type)
 
         self.after(0, self._log, f"[..] Text sample: {text[:120].strip()!r}")
 
@@ -1046,6 +1240,7 @@ class App(tk.Tk):
                                 key=lambda e: os.path.getctime(e["current"]) if os.path.exists(e["current"]) else 0,
                                 reverse=True)
 
+        renamed_pairs = []
         for i, entry in enumerate(sorted_entries):
             old_path = entry["current"]
             ext = os.path.splitext(old_path)[1].lower()
@@ -1055,6 +1250,7 @@ class App(tk.Tk):
                 os.rename(old_path, new_path)
                 entry["current"] = new_path
                 entry["renamed"] = True
+                renamed_pairs.append((os.path.basename(old_path), new_name))
                 self._log(f"[OK] {new_name}")
             except Exception as e:
                 self._log(f"[X]  {os.path.basename(old_path)}: {e}")
@@ -1067,7 +1263,11 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-        append_history(permit, address, sbl)
+        append_history(permit, address, sbl, status)
+        try:
+            archive_confirm(renamed_pairs, permit, address, sbl, status, self._laserfiche_path())
+        except Exception as e:
+            self._log(f"[!]  Archive update failed: {e}")
         self._update_stats()
         self.confirm_btn.config(state="disabled")
         self._log(f"[--] {len(sorted_entries)} file(s) renamed — drag from staging to Laserfiche")
@@ -1144,8 +1344,8 @@ class App(tk.Tk):
         mid = ttk.Frame(win)
         mid.pack(fill="both", expand=True, padx=8, pady=4)
 
-        cols    = ("date", "permit_id", "address", "sbl")
-        headers = ("Date", "Permit ID", "Address", "SBL")
+        cols    = ("date", "permit_id", "address", "sbl", "status")
+        headers = ("Date", "Permit ID", "Address", "SBL", "Status")
         tree = ttk.Treeview(mid, columns=cols, show="headings",
                             height=16, selectmode="extended")
 
@@ -1166,8 +1366,9 @@ class App(tk.Tk):
             tree.heading(col, text=hdr, command=lambda c=col: _sort_by(c))
         tree.column("date",      width=130, minwidth=100, stretch=False)
         tree.column("permit_id", width=110, minwidth=90,  stretch=False)
-        tree.column("address",   width=260, minwidth=150)
+        tree.column("address",   width=240, minwidth=150)
         tree.column("sbl",       width=110, minwidth=80,  stretch=False)
+        tree.column("status",    width=70,  minwidth=60,  stretch=False)
 
         sb = ttk.Scrollbar(mid, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=sb.set)
@@ -1253,6 +1454,7 @@ class App(tk.Tk):
                 tree.insert("", "end", values=(
                     entry.get("date", ""), entry.get("permit_id", ""),
                     entry.get("address", ""), entry.get("sbl", ""),
+                    entry.get("status", ""),
                 ))
             shown = len(rows)
             total = len(history)
@@ -1268,6 +1470,126 @@ class App(tk.Tk):
 
         tree.bind("<Double-1>", _load_entry)
         tree.bind("<Delete>",   lambda e: _delete_selected())
+
+    def _show_archive(self):
+        """Full-text search across every scan ever archived — searches the OCR text
+        itself, not just the filed metadata."""
+        win = tk.Toplevel(self)
+        win.title("Search Archive — full text of every scan")
+        win.resizable(True, True)
+        win.geometry("920x580")
+        win.minsize(640, 400)
+
+        top = ttk.Frame(win)
+        top.pack(fill="x", padx=8, pady=(8, 2))
+        ttk.Label(top, text="Search:").pack(side="left")
+        search_var = tk.StringVar()
+        search_entry = ttk.Entry(top, textvariable=search_var, width=40)
+        search_entry.pack(side="left", padx=(4, 0))
+        search_entry.focus()
+        ttk.Label(top, text="matches permit ID, address, SBL, and the scanned text",
+                  font=("Segoe UI", 8), foreground="#888888").pack(side="left", padx=(8, 0))
+
+        mid = ttk.Frame(win)
+        mid.pack(fill="both", expand=True, padx=8, pady=4)
+
+        cols    = ("date", "permit_id", "address", "sbl", "status", "file", "match")
+        headers = ("Date", "Permit ID", "Address", "SBL", "Status", "File", "Match")
+        tree = ttk.Treeview(mid, columns=cols, show="headings", height=12, selectmode="browse")
+        for col, hdr in zip(cols, headers):
+            tree.heading(col, text=hdr)
+        tree.column("date",      width=120, minwidth=100, stretch=False)
+        tree.column("permit_id", width=100, minwidth=85,  stretch=False)
+        tree.column("address",   width=180, minwidth=120, stretch=False)
+        tree.column("sbl",       width=100, minwidth=80,  stretch=False)
+        tree.column("status",    width=60,  minwidth=55,  stretch=False)
+        tree.column("file",      width=130, minwidth=90,  stretch=False)
+        tree.column("match",     width=200, minwidth=120)
+
+        sb = ttk.Scrollbar(mid, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+        mid.columnconfigure(0, weight=1)
+        mid.rowconfigure(0, weight=1)
+
+        detail = tk.Text(win, height=10, wrap="word", font=("Consolas", 9),
+                         bg="#1e1e1e", fg="#d4d4d4", relief="flat", state="disabled")
+        detail.pack(fill="both", expand=False, padx=8, pady=(2, 4))
+
+        foot = ttk.Frame(win)
+        foot.pack(fill="x", padx=8, pady=(0, 8))
+        status_var = tk.StringVar()
+        ttk.Label(foot, textvariable=status_var, foreground="#888888").pack(side="left")
+
+        def _selected_record():
+            sel = tree.selection()
+            return archive_get(int(sel[0])) if sel else None
+
+        def _copy_lf_path():
+            rec = _selected_record()
+            if rec and rec["lf_path"]:
+                self.clipboard_clear()
+                self.clipboard_append(rec["lf_path"])
+                status_var.set(f"Copied: {rec['lf_path']}")
+            else:
+                status_var.set("No Laserfiche path on this record")
+
+        def _load_into_form():
+            rec = _selected_record()
+            if not rec:
+                return
+            if rec["permit_id"]:
+                self.permit_id.set(rec["permit_id"])
+            num, street = split_address(rec["address"]) if rec["address"] else ("", "")
+            if street:
+                self.street_num.set(num)
+                self.street_name.set(street)
+            if rec["sbl"]:
+                self.sbl.set(rec["sbl"])
+            if rec["status"]:
+                self.status_var.set(rec["status"])
+            status_var.set("Loaded into main form")
+
+        ttk.Button(foot, text="Copy LF Path",  command=_copy_lf_path,   width=13).pack(side="right", padx=4)
+        ttk.Button(foot, text="Load Into Form", command=_load_into_form, width=14).pack(side="right", padx=4)
+
+        def _show_detail(_event=None):
+            rec = _selected_record()
+            detail.config(state="normal")
+            detail.delete("1.0", "end")
+            if rec:
+                hdr = (f"Permit: {rec['permit_id'] or '—'}   Address: {rec['address'] or '—'}   "
+                       f"SBL: {rec['sbl'] or '—'}   Status: {rec['status'] or '—'}\n"
+                       f"Scanned: {rec['scanned_at'] or '—'}   Filed: {rec['confirmed_at'] or '—'}   "
+                       f"File: {rec['final_name'] or rec['orig_name'] or '—'}\n"
+                       f"Laserfiche: {rec['lf_path'] or '—'}\n"
+                       + "─" * 100 + "\n")
+                detail.insert("1.0", hdr + (rec["text"] or "(no text captured — pre-archive record)"))
+            detail.config(state="disabled")
+
+        def _populate(*_):
+            try:
+                rows = archive_search(search_var.get())
+            except Exception as e:
+                status_var.set(f"Search error: {e}")
+                return
+            tree.delete(*tree.get_children())
+            for r in rows:
+                rid, scanned, permit, address, sbl, status, final, orig, snip = r
+                snip = re.sub(r"\s+", " ", (snip or "")).strip()
+                tree.insert("", "end", iid=str(rid), values=(
+                    scanned or "", permit or "", address or "", sbl or "",
+                    status or "", final or orig or "", snip))
+            n = len(rows)
+            q = search_var.get().strip()
+            status_var.set(f"{n} match{'es' if n != 1 else ''}" if q
+                           else f"{n} most recent scan(s) — type to search")
+            _show_detail()
+
+        search_var.trace_add("write", _populate)
+        tree.bind("<<TreeviewSelect>>", _show_detail)
+        _populate()
 
     def _set_api_key(self):
         current = load_claude_key()
