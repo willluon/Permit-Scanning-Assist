@@ -377,6 +377,20 @@ def reconcile_with_parcels(num, street, sbl, sources, log):
         log(f"[..] SBL repaired from county data: '{sbl}' → '{sbl_hit[0]}'")
         sbl = sbl_hit[0]
 
+    # Address didn't resolve to any parcel (garbled/truncated street) but the SBL
+    # did — if the county's street number for that parcel matches the number we
+    # read, trust the county's street name. Fixes cut-off reads like '3269 STO'.
+    if sbl_hit and not addr_hit and num and street and sbl_hit[1]:
+        m = re.match(r'^(\d+)\s+(.+)$', sbl_hit[1])
+        if m and m.group(1) == str(num):
+            log(f"[..] Street repaired from county data (via SBL): '{street}' → '{m.group(2)}'")
+            street = m.group(2)
+            sources["address"] = "parcel"
+            addr_hit = (sbl_hit[0], m.group(2))
+        elif m:
+            log(f"[!]  Address '{num} {street}' not in county data; SBL {sbl_hit[0]} "
+                f"belongs to {sbl_hit[1]} — verify")
+
     if sbl and not sbl_hit:
         if addr_hit:
             log(f"[!]  SBL '{sbl}' not in county data — using {addr_hit[0]} (from address) instead")
@@ -399,6 +413,10 @@ def reconcile_with_parcels(num, street, sbl, sources, log):
             num, street = m.group(1), m.group(2)
             sources["address"] = "parcel"
             log(f"[OK] Address filled from county parcel data: {num} {street}")
+
+    # Make a clean verification visible — silent success looks like nothing ran
+    if sbl and addr_hit and sbl == addr_hit[0]:
+        log(f"[OK] Verified against county parcels: {num} {street} = {sbl}")
 
     return num, street, sbl, sources
 
