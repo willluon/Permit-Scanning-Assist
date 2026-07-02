@@ -353,6 +353,83 @@ def parcel_lookup_address(num, street):
     return None
 
 
+def laserfiche_path_for(num, street):
+    """Laserfiche folder path for an address (module-level so lookups can use it)."""
+    num = str(num or "").strip()
+    st  = (street or "").strip().upper().rstrip('.')
+    if not num or not st:
+        return ""
+    st_p = st + "."   # Laserfiche convention: "CROW HILL RD."
+    return rf"TownOfYorktown\Building Department\Parcels\{st[0]}\{st_p}\{num} {st_p}"
+
+
+def parcel_search(query, limit=60):
+    """Free-form parcel finder for the Property window. Accepts an SBL (or SBL
+    prefix like '16.17'), an address ('3269 Stony St'), a bare street number,
+    a street name, or an owner name. Returns (print_key, addr, owner) rows."""
+    q = (query or "").strip().upper()
+    if not q:
+        return []
+    # SBL-shaped: digits with a dash or decimal ('16.17-2-75', '16.17')
+    if re.match(r'^[\d.\-\s]+$', q) and ('-' in q or '.' in q):
+        for cand in (_sbl_candidates(q) or [q.replace(' ', '')]):
+            rows = _parcel_query(
+                "SELECT print_key, addr, owner FROM parcels "
+                "WHERE print_key=? OR print_key LIKE ? "
+                "ORDER BY print_key LIMIT ?",
+                (cand, cand + '-%', limit))
+            if rows:
+                return rows
+        return []
+    # Bare street number
+    if q.isdigit():
+        return _parcel_query(
+            "SELECT print_key, addr, owner FROM parcels WHERE st_nbr=? ORDER BY street LIMIT ?",
+            (q, limit))
+    # Number + street
+    m = re.match(r'^(\d+)\s+(.+)$', q)
+    if m:
+        rows = _parcel_query(
+            "SELECT print_key, addr, owner FROM parcels WHERE st_nbr=? AND street LIKE ? "
+            "ORDER BY street LIMIT ?",
+            (m.group(1), _norm_street_key(m.group(2)) + '%', limit))
+        if rows:
+            return rows
+    # Street name
+    rows = _parcel_query(
+        "SELECT print_key, addr, owner FROM parcels WHERE street LIKE ? AND addr != '' "
+        "ORDER BY street, CAST(st_nbr AS INTEGER) LIMIT ?",
+        (_norm_street_key(q) + '%', limit))
+    if rows:
+        return rows
+    # Owner name
+    return _parcel_query(
+        "SELECT print_key, addr, owner FROM parcels WHERE owner LIKE ? "
+        "ORDER BY owner LIMIT ?",
+        ('%' + q + '%', limit))
+
+
+def archive_scans_for_parcel(print_key, addr):
+    """Every archived scan for a parcel, matched by SBL (normalized or not) or
+    by address with punctuation stripped. Same row shape as archive_search."""
+    con = _archive_con()
+    try:
+        sbls = {print_key, re.sub(r'\.0(\d)', r'.\1', print_key)}  # 36.05-… also as 36.5-…
+        pat = None
+        if addr:
+            pat = re.sub(r'\s+', ' ', addr.upper().replace('.', '')).strip() + '%'
+        return con.execute(
+            f"""SELECT id, scanned_at, permit_id, address, sbl, status, final_name, orig_name,
+                       substr(text, 1, 200)
+                FROM scans
+                WHERE sbl IN ({','.join('?' * len(sbls))})
+                   OR (? IS NOT NULL AND REPLACE(REPLACE(UPPER(address), '.', ''), ',', '') LIKE ?)
+                ORDER BY id DESC""",
+            (*sbls, pat, pat)).fetchall()
+    finally:
+        con.close()
+
+
 def reconcile_with_parcels(num, street, sbl, sources, log):
     """Cross-check extracted fields against county parcel data.
 
@@ -863,17 +940,21 @@ class App(tk.Tk):
                                       width=18, state="disabled")
         self.confirm_btn.pack(side="left", padx=6)
         ttk.Button(bf, text="New Permit",     command=self._new_permit,    width=12).pack(side="left", padx=6)
-        ttk.Button(bf, text="Open Staging",   command=self._open_staging,  width=13).pack(side="left", padx=6)
-        ttk.Button(bf, text="History",        command=self._show_history,  width=9).pack(side="left", padx=6)
-        ttk.Button(bf, text="Search",         command=self._show_archive,  width=8).pack(side="left", padx=6)
-        ttk.Button(bf, text="Show OCR",       command=self._show_ocr,      width=9).pack(side="left", padx=6)
         ttk.Button(bf, text="Re-OCR",         command=self._reocr_staging, width=8).pack(side="left", padx=6)
-        ttk.Button(bf, text="API Key",        command=self._set_api_key,   width=8).pack(side="left", padx=6)
+        ttk.Button(bf, text="Open Staging",   command=self._open_staging,  width=13).pack(side="left", padx=6)
+
+        bf2 = ttk.Frame(self)
+        bf2.grid(row=5, column=0, padx=12, pady=(0, 6))
+        ttk.Button(bf2, text="History",       command=self._show_history,  width=9).pack(side="left", padx=6)
+        ttk.Button(bf2, text="Search",        command=self._show_archive,  width=8).pack(side="left", padx=6)
+        ttk.Button(bf2, text="Property",      command=self._show_property, width=9).pack(side="left", padx=6)
+        ttk.Button(bf2, text="Show OCR",      command=self._show_ocr,      width=9).pack(side="left", padx=6)
+        ttk.Button(bf2, text="API Key",       command=self._set_api_key,   width=8).pack(side="left", padx=6)
 
         self._stats_var = tk.StringVar()
         ttk.Label(self, textvariable=self._stats_var,
                   font=("Segoe UI", 8), foreground="#888888").grid(
-                  row=5, column=0, pady=(0, 6))
+                  row=6, column=0, pady=(0, 6))
 
     # ── Path helpers ──────────────────────────────────────────────────────────
 
@@ -890,12 +971,7 @@ class App(tk.Tk):
                    fg="white")
 
     def _laserfiche_path(self):
-        num = self.street_num.get().strip()
-        st  = self.street_name.get().strip().upper().rstrip('.')
-        if not num or not st:
-            return ""
-        st_p = st + "."   # Laserfiche convention: "CROW HILL RD."
-        return rf"TownOfYorktown\Building Department\Parcels\{st[0]}\{st_p}\{num} {st_p}"
+        return laserfiche_path_for(self.street_num.get(), self.street_name.get())
 
     def _refresh_path(self):
         path = self._laserfiche_path()
@@ -1607,6 +1683,149 @@ class App(tk.Tk):
 
         search_var.trace_add("write", _populate)
         tree.bind("<<TreeviewSelect>>", _show_detail)
+        _populate()
+
+    def _show_property(self):
+        """Property history lookup: address / SBL / street / owner → parcel info,
+        every scan on file, and the Laserfiche path."""
+        win = tk.Toplevel(self)
+        win.title("Property Lookup")
+        win.resizable(True, True)
+        win.geometry("860x600")
+        win.minsize(620, 440)
+
+        top = ttk.Frame(win)
+        top.pack(fill="x", padx=8, pady=(8, 2))
+        ttk.Label(top, text="Property:").pack(side="left")
+        search_var = tk.StringVar()
+        search_entry = ttk.Entry(top, textvariable=search_var, width=36)
+        search_entry.pack(side="left", padx=(4, 0))
+        search_entry.focus()
+        ttk.Label(top, text="address, SBL, street, or owner name",
+                  font=("Segoe UI", 8), foreground="#888888").pack(side="left", padx=(8, 0))
+
+        # ── Parcel matches ──
+        pf = ttk.LabelFrame(win, text="Parcels (county data)", padding=4)
+        pf.pack(fill="both", expand=True, padx=8, pady=4)
+        pcols = ("sbl", "address", "owner")
+        ptree = ttk.Treeview(pf, columns=pcols, show="headings", height=7, selectmode="browse")
+        for c, h, w in (("sbl", "SBL", 130), ("address", "Address", 240), ("owner", "Owner", 260)):
+            ptree.heading(c, text=h)
+            ptree.column(c, width=w, minwidth=80, stretch=(c == "owner"))
+        psb = ttk.Scrollbar(pf, orient="vertical", command=ptree.yview)
+        ptree.configure(yscrollcommand=psb.set)
+        ptree.grid(row=0, column=0, sticky="nsew")
+        psb.grid(row=0, column=1, sticky="ns")
+        pf.columnconfigure(0, weight=1)
+        pf.rowconfigure(0, weight=1)
+
+        # ── Scans on file for the selected parcel ──
+        sf = ttk.LabelFrame(win, text="Scans on file", padding=4)
+        sf.pack(fill="both", expand=True, padx=8, pady=4)
+        scols = ("date", "permit_id", "status", "file", "sbl")
+        stree = ttk.Treeview(sf, columns=scols, show="headings", height=7, selectmode="browse")
+        for c, h, w in (("date", "Date", 120), ("permit_id", "Permit ID", 100),
+                        ("status", "Status", 70), ("file", "File", 200), ("sbl", "SBL", 110)):
+            stree.heading(c, text=h)
+            stree.column(c, width=w, minwidth=60, stretch=(c == "file"))
+        ssb = ttk.Scrollbar(sf, orient="vertical", command=stree.yview)
+        stree.configure(yscrollcommand=ssb.set)
+        stree.grid(row=0, column=0, sticky="nsew")
+        ssb.grid(row=0, column=1, sticky="ns")
+        sf.columnconfigure(0, weight=1)
+        sf.rowconfigure(0, weight=1)
+
+        path_var = tk.StringVar(value="Select a parcel above")
+        ttk.Label(win, textvariable=path_var, font=("Consolas", 9),
+                  foreground="#555555", wraplength=820).pack(fill="x", padx=10)
+
+        foot = ttk.Frame(win)
+        foot.pack(fill="x", padx=8, pady=(4, 8))
+        status_var = tk.StringVar()
+        ttk.Label(foot, textvariable=status_var, foreground="#888888").pack(side="left")
+
+        def _selected_parcel():
+            sel = ptree.selection()
+            if not sel:
+                return None
+            v = ptree.item(sel[0], "values")
+            return {"sbl": v[0], "address": v[1], "owner": v[2]}
+
+        def _lf_path_for_selected():
+            p = _selected_parcel()
+            if not p or not p["address"]:
+                return ""
+            m = re.match(r'^(\d+)\s+(.+)$', p["address"])
+            return laserfiche_path_for(m.group(1), m.group(2)) if m else ""
+
+        def _copy_lf():
+            path = _lf_path_for_selected()
+            if path:
+                self.clipboard_clear()
+                self.clipboard_append(path)
+                status_var.set("Laserfiche path copied")
+            else:
+                status_var.set("No address on this parcel — no path to copy")
+
+        def _use_property():
+            p = _selected_parcel()
+            if not p:
+                return
+            m = re.match(r'^(\d+)\s+(.+)$', p["address"] or "")
+            if m:
+                self.street_num.set(m.group(1))
+                self.street_name.set(m.group(2))
+            self.sbl.set(p["sbl"])
+            self._current_sources["address"] = "parcel"
+            self._current_sources["sbl"] = "parcel"
+            self._update_src_label("address", "parcel")
+            self._update_src_label("sbl", "parcel")
+            status_var.set("Filled into main form (county-verified)")
+
+        ttk.Button(foot, text="Copy LF Path",      command=_copy_lf,      width=13).pack(side="right", padx=4)
+        ttk.Button(foot, text="Use This Property", command=_use_property, width=17).pack(side="right", padx=4)
+
+        def _fill_scans(_event=None):
+            stree.delete(*stree.get_children())
+            p = _selected_parcel()
+            if not p:
+                path_var.set("Select a parcel above")
+                return
+            path_var.set(_lf_path_for_selected() or "(no address — no Laserfiche path)")
+            try:
+                rows = archive_scans_for_parcel(p["sbl"], p["address"])
+            except Exception as e:
+                status_var.set(f"Archive error: {e}")
+                return
+            for r in rows:
+                rid, scanned, permit, address, sbl, status, final, orig, _snip = r
+                stree.insert("", "end", iid=str(rid), values=(
+                    scanned or "", permit or "", status or "", final or orig or "", sbl or ""))
+            n = len(rows)
+            owner = f"   ·   Owner: {p['owner']}" if p["owner"] else ""
+            status_var.set(f"{n} scan(s) on file for {p['sbl']}{owner}")
+
+        def _populate(*_):
+            ptree.delete(*ptree.get_children())
+            stree.delete(*stree.get_children())
+            path_var.set("Select a parcel above")
+            q = search_var.get()
+            if not q.strip():
+                status_var.set("Type an address, SBL, street, or owner to look up a property")
+                return
+            try:
+                rows = parcel_search(q)
+            except Exception as e:
+                status_var.set(f"Lookup error: {e}")
+                return
+            for i, (pk, addr, owner) in enumerate(rows):
+                ptree.insert("", "end", iid=f"p{i}", values=(pk, addr or "", owner or ""))
+            status_var.set(f"{len(rows)} parcel(s) match")
+            if len(rows) == 1:
+                ptree.selection_set("p0")
+
+        search_var.trace_add("write", _populate)
+        ptree.bind("<<TreeviewSelect>>", _fill_scans)
         _populate()
 
     def _set_api_key(self):

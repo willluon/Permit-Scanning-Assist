@@ -64,6 +64,12 @@ Permit subtype is detected and displayed in the UI (e.g. "Electrical Permit", "D
 - Records are stamped at Confirm & Rename with the final filename, OPEN/CLOSED status, and Laserfiche path — so a search result tells you exactly where the document lives
 - **Copy LF Path** and **Load Into Form** buttons on each result; prior history was imported automatically on first run
 
+### Property Lookup
+- One search box accepts an **address, SBL (or SBL prefix), bare street number, street name, or owner name**
+- Shows matching parcels from county data (SBL, address, owner from the assessment roll)
+- Selecting a parcel lists **every scan on file** for it and shows its **Laserfiche path**
+- **Use This Property** fills the main form with county-verified address + SBL — useful when filing a permit for a known property without waiting on OCR
+
 ### Safety
 - **Duplicate permit warning** — before renaming, checks history for the same permit ID and prompts staff if a match is found, showing the date and address it was previously filed under
 

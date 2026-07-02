@@ -26,7 +26,7 @@ SERVICE_URL = (
     "NYS_Tax_Parcel_Centroid_Points/MapServer/0/query"
 )
 WHERE      = "MUNI_NAME='Yorktown' AND COUNTY_NAME='Westchester'"
-OUT_FIELDS = "PRINT_KEY,PARCEL_ADDR,LOC_ST_NBR,LOC_STREET"
+OUT_FIELDS = "PRINT_KEY,PARCEL_ADDR,LOC_ST_NBR,LOC_STREET,PRIMARY_OWNER"
 PAGE_SIZE  = 1000
 
 
@@ -71,7 +71,8 @@ def download_parcels():
             addr   = (a.get("PARCEL_ADDR") or "").strip().upper().rstrip(".")
             st_nbr = str(a.get("LOC_ST_NBR") or "").strip()
             street = normalize_street(a.get("LOC_STREET") or "")
-            rows.append((print_key, addr, st_nbr, street))
+            owner  = (a.get("PRIMARY_OWNER") or "").strip()
+            rows.append((print_key, addr, st_nbr, street, owner))
         print(f"  fetched {offset + len(feats)} parcels...")
         if not data.get("exceededTransferLimit") and len(feats) < PAGE_SIZE:
             break
@@ -89,13 +90,14 @@ def write_db(rows, db_path=PARCEL_DB):
             print_key TEXT NOT NULL,   -- SBL, Yorktown dotted format e.g. 48.11-1-11
             addr      TEXT,            -- full parcel address e.g. 1191 WILLIAMS DR
             st_nbr    TEXT,            -- street number e.g. 1191
-            street    TEXT             -- normalized street e.g. WILLIAMS DR
+            street    TEXT,            -- normalized street e.g. WILLIAMS DR
+            owner     TEXT             -- primary owner from assessment roll
         );
         CREATE INDEX idx_print_key ON parcels(print_key);
         CREATE INDEX idx_addr      ON parcels(st_nbr, street);
         CREATE INDEX idx_street    ON parcels(street);
     """)
-    con.executemany("INSERT INTO parcels VALUES (?,?,?,?)", rows)
+    con.executemany("INSERT INTO parcels VALUES (?,?,?,?,?)", rows)
     con.commit()
     con.close()
     if os.path.exists(db_path):
