@@ -25,8 +25,10 @@ IGNORE_ADDRESSES = ["363 UNDERHILL AVE"]
 
 # Source tracking
 # tesseract_hw = Tesseract on handwriting — less reliable than Claude for numeric fields
-_SOURCE_RANK = {"native": 4, "tesseract": 3, "claude": 2, "tesseract_hw": 1, "": 0}
+# parcel       = county GIS parcel data (yorktown_parcels.db) — authoritative, outranks everything
+_SOURCE_RANK = {"parcel": 5, "native": 4, "tesseract": 3, "claude": 2, "tesseract_hw": 1, "": 0}
 _SRC_STYLE   = {
+    "parcel":       ("county",     "#00695c"),
     "native":       ("text",       "#2e7d32"),
     "tesseract":    ("ocr",        "#e65100"),
     "claude":       ("ai  ←verify","#1565c0"),
@@ -257,6 +259,149 @@ def split_address(full_address):
     return "", normalize_suffix(full_address.strip())
 
 
+# ── County parcel data (yorktown_parcels.db, built by build_parcel_db.py) ─────
+# Address ↔ SBL for every Yorktown parcel from the NYS GIS assessment roll.
+# Lets us fill either field from the other and catch OCR misreads against
+# authoritative data instead of trying to read the form harder.
+
+PARCEL_DB_FILE = os.path.join(_HOME, "yorktown_parcels.db")
+
+
+def parcel_db_available():
+    return os.path.exists(PARCEL_DB_FILE)
+
+
+def _parcel_query(sql, params=()):
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{PARCEL_DB_FILE}?mode=ro", uri=True)
+        try:
+            return con.execute(sql, params).fetchall()
+        finally:
+            con.close()
+    except Exception:
+        return []
+
+
+def _norm_street_key(street):
+    return re.sub(r'\s+', ' ', street.upper().rstrip('.').strip())
+
+
+def _sbl_candidates(sbl):
+    """Plausible official print_key forms of an as-read SBL, best guess first.
+
+    Official sections are always N.NN / NN.NN (fraction exactly 2 digits), so:
+    - '5910-1-4'  → try '59.10-1-4'   (OCR dropped the decimal point)
+    - '16.6-1-3'  → try '16.06-1-3' and '16.60-1-3'  (handwriting drops the zero)
+    Leading zeros on integer parts are stripped ('01' → '1').
+    """
+    s = re.sub(r'\s+', '', sbl or '')
+    parts = s.split('-')
+    if len(parts) < 3:
+        return [s] if s else []
+
+    def clean(p):
+        m = re.match(r'^0*(\d+)(\.\d+)?$', p)
+        return (m.group(1) + (m.group(2) or '')) if m else p
+
+    parts = [clean(p) for p in parts]
+    sec, rest = parts[0], parts[1:]
+    secs = [sec]
+    if '.' in sec:
+        whole, frac = sec.split('.', 1)
+        if len(frac) == 1:
+            secs += [f"{whole}.0{frac}", f"{whole}.{frac}0"]
+    elif sec.isdigit() and 3 <= len(sec) <= 4:
+        secs.append(f"{int(sec[:-2])}.{sec[-2:]}")
+    out = []
+    for sc in secs:
+        cand = '-'.join([sc] + rest)
+        if cand not in out:
+            out.append(cand)
+    return out
+
+
+def parcel_lookup_sbl(sbl):
+    """Match an as-read SBL against county data. Returns (print_key, addr) or None."""
+    for cand in _sbl_candidates(sbl):
+        rows = _parcel_query("SELECT print_key, addr FROM parcels WHERE print_key=?", (cand,))
+        if rows:
+            return rows[0]
+    return None
+
+
+def parcel_lookup_address(num, street):
+    """Find the parcel for a street number + name. Returns (print_key, street) or None.
+
+    Falls back to suffix-agnostic matching (HICKORY LN → HICKORY ST) when the
+    exact street has no such number — but only if the match is unambiguous."""
+    if not num or not street:
+        return None
+    st = _norm_street_key(street)
+    rows = _parcel_query("SELECT print_key, street FROM parcels WHERE st_nbr=? AND street=?",
+                         (str(num), st))
+    if rows:
+        return rows[0]
+    base = re.sub(rf'\s+({STREET_SUFFIXES})\.?$', '', st, flags=re.IGNORECASE).strip()
+    if base and base != st:
+        rows = _parcel_query(
+            "SELECT print_key, street FROM parcels WHERE st_nbr=? AND (street=? OR street LIKE ?)",
+            (str(num), base, base + ' %'))
+        if len({r[1] for r in rows}) == 1:
+            return rows[0]
+    return None
+
+
+def reconcile_with_parcels(num, street, sbl, sources, log):
+    """Cross-check extracted fields against county parcel data.
+
+    - Repairs OCR-mangled SBLs (dropped decimal, dropped zero-padding) when the
+      repaired form exists in the county data.
+    - Corrects a wrong street suffix when number + base name is unambiguous.
+    - Fills a missing SBL from the address (and vice versa) — source "parcel".
+    - Flags an SBL that contradicts the address WITHOUT overwriting a plausible
+      one — permits are historical and parcels do get renumbered.
+    Returns possibly-updated (num, street, sbl, sources).
+    """
+    if not parcel_db_available():
+        return num, street, sbl, sources
+
+    addr_hit = parcel_lookup_address(num, street) if (num and street) else None
+    if addr_hit and _norm_street_key(street) != addr_hit[1]:
+        log(f"[..] Street corrected from county data: '{street}' → '{addr_hit[1]}'")
+        street = addr_hit[1]
+
+    sbl_hit = parcel_lookup_sbl(sbl) if sbl else None
+    if sbl and sbl_hit and sbl_hit[0] != re.sub(r'\s+', '', sbl):
+        log(f"[..] SBL repaired from county data: '{sbl}' → '{sbl_hit[0]}'")
+        sbl = sbl_hit[0]
+
+    if sbl and not sbl_hit:
+        if addr_hit:
+            log(f"[!]  SBL '{sbl}' not in county data — using {addr_hit[0]} (from address) instead")
+            sbl = addr_hit[0]
+            sources["sbl"] = "parcel"
+        else:
+            log(f"[!]  SBL '{sbl}' not found in county parcel data — verify")
+    elif sbl and sbl_hit and addr_hit and sbl_hit[0] != addr_hit[0]:
+        log(f"[!]  SBL/address conflict: form says {sbl_hit[0]}, county lists "
+            f"{num} {street} as {addr_hit[0]} — verify before filing")
+
+    if not sbl and addr_hit:
+        sbl = addr_hit[0]
+        sources["sbl"] = "parcel"
+        log(f"[OK] SBL filled from county parcel data: {sbl}")
+
+    if not street and sbl_hit and sbl_hit[1]:
+        m = re.match(r'^(\d+)\s+(.+)$', sbl_hit[1])
+        if m:
+            num, street = m.group(1), m.group(2)
+            sources["address"] = "parcel"
+            log(f"[OK] Address filled from county parcel data: {num} {street}")
+
+    return num, street, sbl, sources
+
+
 # ── Claude vision helpers ──────────────────────────────────────────────────────
 
 def load_claude_key():
@@ -448,6 +593,7 @@ class App(tk.Tk):
         self._sbl_entry.pack(side="left")
         ttk.Button(sbl_frame, text="Copy", width=5, command=self._copy_sbl).pack(side="left", padx=(4, 0))
         ttk.Style().configure("SBLInvalid.TEntry", foreground="#c62828")
+        ttk.Style().configure("SBLWarn.TEntry",    foreground="#e65100")
         self._src_labels["sbl"] = tk.Label(info, text="", font=("Consolas", 8), width=12, anchor="w", relief="flat", bd=0)
         self._src_labels["sbl"].grid(row=3, column=2, sticky="w")
 
@@ -574,9 +720,18 @@ class App(tk.Tk):
             self.clipboard_append(sbl)
 
     def _validate_sbl(self):
+        """Red = bad format. Orange = valid format but no such parcel in county data.
+        Lots/blocks may carry decimals (5.17-1-18.1) and condos a unit part
+        (15.16-1-21.1-2) — all real Yorktown print keys."""
         val = self.sbl.get().strip()
-        valid = not val or bool(re.match(r'^\d{1,3}\.\d{1,3}-\d{1,3}-\d{1,3}$', val))
-        self._sbl_entry.config(style="TEntry" if valid else "SBLInvalid.TEntry")
+        valid = not val or bool(re.match(
+            r'^\d{1,3}\.\d{1,3}-\d{1,3}(?:\.\d{1,3})?-\d{1,3}(?:\.\d{1,3})?(?:-\d{1,3})?$', val))
+        style = "TEntry"
+        if not valid:
+            style = "SBLInvalid.TEntry"
+        elif val and parcel_db_available() and not parcel_lookup_sbl(val):
+            style = "SBLWarn.TEntry"
+        self._sbl_entry.config(style=style)
 
     def _on_hotkey(self, event):
         if isinstance(self.focus_get(), (ttk.Entry, tk.Entry, tk.Text)):
@@ -788,6 +943,8 @@ class App(tk.Tk):
             if corrected != street:
                 self.after(0, self._log, f"[..] Street corrected: '{street}' → '{corrected}'")
             street = corrected
+        num, street, sbl, sources = reconcile_with_parcels(
+            num, street, sbl, sources, lambda m: self.after(0, self._log, m))
         return permit, num, street, sbl, sources
 
     def _ocr_and_fill(self, path):
@@ -1304,6 +1461,11 @@ class App(tk.Tk):
 
         best_sources["form_type"] = best_form_type
         best_sources["form_page"] = best_form_page
+        # Final cross-check on the merged result — catches an address from one
+        # file conflicting with an SBL from another (per-file reconcile can't).
+        best_num, best_street, best_sbl, best_sources = reconcile_with_parcels(
+            best_num, best_street, best_sbl, best_sources,
+            lambda m: self.after(0, self._log, m))
         if best_permit or best_street or best_sbl:
             self.after(0, self._apply_extracted,
                        best_permit, best_num, best_street, best_sbl, best_sources)

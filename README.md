@@ -14,8 +14,14 @@ When a permit is scanned, the tool:
    - **Permit ID** — 8-digit permit number
    - **Property Address** — street number + street name, fuzzy-matched against a validated Yorktown street list
    - **SBL** — Section-Block-Lot parcel identifier (e.g. `48.11-1-11`)
-4. **Calculates the Laserfiche path** for the document and copies it to the clipboard automatically
-5. **Renames staged files** to match Yorktown filing conventions (`{PermitID} OPEN.pdf`, `{PermitID} CLOSED.pdf`, etc.)
+4. **Cross-checks against county parcel data** (`yorktown_parcels.db`, all 14,407 Yorktown parcels from the NYS GIS assessment roll):
+   - Fills a missing SBL from the address, or a missing address from the SBL
+   - Repairs OCR-mangled SBLs (dropped decimal points, dropped zero-padding — `2710-3-34` → `27.10-3-34`)
+   - Corrects wrong street suffixes when the number + base name is unambiguous (`3018 Hickory Ln` → `3018 HICKORY ST`)
+   - Flags an SBL that contradicts the address for review before filing
+   - Parcel-sourced values show a `county` source label; the SBL field turns orange if the value isn't a real Yorktown parcel
+5. **Calculates the Laserfiche path** for the document and copies it to the clipboard automatically
+6. **Renames staged files** to match Yorktown filing conventions (`{PermitID} OPEN.pdf`, `{PermitID} CLOSED.pdf`, etc.)
 
 The staff member then drags the staged file into Laserfiche and pastes the pre-built path — no typing required.
 
@@ -123,6 +129,7 @@ Laserfiche is the Town's official records management system. Every building perm
 | File | Purpose |
 |------|---------|
 | `permit_scan.py` | Main application — GUI, OCR pipeline, extraction logic |
+| `build_parcel_db.py` | Downloads all Yorktown parcels (SBL + address) from the NYS GIS tax parcel service into `~\yorktown_parcels.db`. Re-run yearly when new assessment rolls publish. |
 | `yorktown_streets.txt` | Validated list of ~500 Yorktown street names used for fuzzy matching |
 
 ---
