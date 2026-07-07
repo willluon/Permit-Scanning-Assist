@@ -124,18 +124,40 @@ def extract_text_from_page(doc, page_idx):
     return (native + "\n" + ocr).strip()
 
 
-def quick_ocr_page_type(doc, page_idx):
-    """Single-pass 1.5× Tesseract classification of one page — detection only."""
+def quick_page_text(doc, page_idx):
+    """Cheap text for one page: native layer if present, else single-pass 1.5× Tesseract."""
     import fitz
     import pytesseract
     from PIL import Image
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+    native = doc[page_idx].get_text().strip()
+    if native:
+        return native
     pix  = doc[page_idx].get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
     gray = Image.frombytes("RGB", [pix.width, pix.height], pix.samples).convert("L")
     try:
-        return detect_permit_type(pytesseract.image_to_string(gray, config="--psm 3 --oem 3"))
+        return pytesseract.image_to_string(gray, config="--psm 3 --oem 3")
     except Exception:
-        return "unknown"
+        return ""
+
+
+def quick_ocr_page_type(doc, page_idx):
+    """Single-pass 1.5× Tesseract classification of one page — detection only."""
+    return detect_permit_type(quick_page_text(doc, page_idx))
+
+
+# ── Merge-on-confirm ordering ──────────────────────────────────────────────────
+# All staged files are assembled into ONE PDF at Confirm & Rename, in filing
+# order: official permit first, everything else in scan order, building plans
+# near the end, orange folder cover last.
+_IMAGE_EXTS  = ('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp')
+_STAGE_EXTS  = ('.pdf',) + _IMAGE_EXTS
+_MERGE_ORDER = {"official": 0, "other": 1, "plans": 2, "orange": 3}
+_LEGAL_AREA  = 612 * 1008   # 8.5×14 in PDF points — anything well past this is plan-sized
+# Oversized sheets that are regular documents, NOT building plans
+_OVERSIZE_FORM_RE = re.compile(r'INSPECTION\s+PROCEDURE', re.IGNORECASE)
+# Orange folder cover labels (preprinted, so Tesseract reads them reliably)
+_ORANGE_LABEL_RE  = re.compile(r'BLDG\.?\s*PER|LOCATION\s+OF\s+PROJECT', re.IGNORECASE)
 
 
 def try_flip_official(doc, page_idx, classify, log=None):
@@ -396,11 +418,20 @@ def _sbl_candidates(sbl):
 
 
 def parcel_lookup_sbl(sbl):
-    """Match an as-read SBL against county data. Returns (print_key, addr) or None."""
+    """Match an as-read SBL against county data. Returns (print_key, addr) or None.
+
+    Condo complexes: permits carry the base lot (15.20-1-28) but the county roll
+    only lists the subdivided unit keys (15.20-1-28.1-1, ...). A candidate whose
+    units exist is accepted as-is, with no address (units span many numbers)."""
     for cand in _sbl_candidates(sbl):
         rows = _parcel_query("SELECT print_key, addr FROM parcels WHERE print_key=?", (cand,))
         if rows:
             return rows[0]
+    for cand in _sbl_candidates(sbl):
+        rows = _parcel_query("SELECT COUNT(*) FROM parcels WHERE print_key LIKE ?",
+                             (cand + '.%',))
+        if rows and rows[0][0]:
+            return (cand, None)
     return None
 
 
@@ -891,6 +922,7 @@ class App(tk.Tk):
 
         # Each entry: {"current": path_in_staging, "renamed": False}
         self.staged = []
+        self.file_class = {}   # path → classified form type, cached for merge ordering
         self._scanning = False
         self._src_labels = {}
         self._current_sources = {"permit": "", "address": "", "sbl": ""}
@@ -1157,6 +1189,12 @@ class App(tk.Tk):
         self.staged.append({"current": staging_path, "renamed": False})
         self._log(f"[IN]  {filename}  →  staging (copy)")
 
+        # Image files are building plans — staged for the merge, never a data source
+        if ext in _IMAGE_EXTS:
+            self._log("[--]  Image file staged as building plans — skipped as data source")
+            self.confirm_btn.config(state="normal")
+            return
+
         if not self.permit_id.get().strip():
             self._log("[..]  Reading document...")
             threading.Thread(target=self._ocr_and_fill, args=(staging_path,), daemon=True).start()
@@ -1221,6 +1259,7 @@ class App(tk.Tk):
         elif application_idx is not None:
             # Application forms are staged for filing but not used as a data source
             self.after(0, self._log, "[--] Application form detected — staged for filing, not used as data source")
+            self.file_class[path] = "application"
             self._archive_scan_text(doc, path, "", "application")
             doc.close()
             return "", "", "", "", {"permit": "", "address": "", "sbl": "", "form_type": "application", "form_page": application_idx + 1}
@@ -1228,6 +1267,7 @@ class App(tk.Tk):
             target, permit_type = 0, "unknown"
 
         self.after(0, self._log, f"[..] Form type: {permit_type} (page {target + 1})")
+        self.file_class[path] = permit_type
 
         # Push a quick 1.5× render of the target page to the preview panel
         try:
@@ -1417,41 +1457,155 @@ class App(tk.Tk):
                 return
 
         unrenamed = [e for e in self.staged if not e["renamed"]]
-        sorted_entries = sorted(unrenamed,
-                                key=lambda e: os.path.getctime(e["current"]) if os.path.exists(e["current"]) else 0,
-                                reverse=True)
+        if not unrenamed:
+            self._log("[!]  Nothing in staging to confirm")
+            return
+        if self._scanning:
+            self._log("[--] Scan in progress — wait for it to finish before confirming")
+            return
 
-        renamed_pairs = []
-        for i, entry in enumerate(sorted_entries):
-            old_path = entry["current"]
-            ext = os.path.splitext(old_path)[1].lower()
-            new_name = f"{permit} {status}{ext}" if i == 0 else f"{permit} - {i + 1}{ext}"
-            new_path = os.path.join(STAGING_FOLDER, new_name)
+        new_name = f"{permit} {status}.pdf"
+        new_path = os.path.join(STAGING_FOLDER, new_name)
+        self.confirm_btn.config(state="disabled")
+        lf_path = self._laserfiche_path()
+
+        # Single PDF: plain rename, no rewrite
+        if len(unrenamed) == 1 and unrenamed[0]["current"].lower().endswith(".pdf"):
+            entry = unrenamed[0]
+            old_name = os.path.basename(entry["current"])
             try:
-                os.rename(old_path, new_path)
-                entry["current"] = new_path
-                entry["renamed"] = True
-                renamed_pairs.append((os.path.basename(old_path), new_name))
-                self._log(f"[OK] {new_name}")
+                os.rename(entry["current"], new_path)
             except Exception as e:
-                self._log(f"[X]  {os.path.basename(old_path)}: {e}")
+                self._log(f"[X]  {old_name}: {e}")
+                self.confirm_btn.config(state="normal")
+                return
+            entry["current"] = new_path
+            entry["renamed"] = True
+            self._log(f"[OK] {new_name}")
+            # A pre-merged batch carries its original filenames — stamp each
+            # component's archive row, not the merged name
+            pairs = [(c, new_name) for c in entry.get("components", [old_name])]
+            self._finish_confirm(pairs, new_path, permit, address, sbl, status, lf_path)
+            return
 
-        # Touch the main file last so it has the newest mtime — Laserfiche picks
-        # the newest file as the document name when multiple files are dragged in.
-        if sorted_entries and sorted_entries[0]["renamed"]:
+        # Multiple files (or images): assemble one PDF in filing order
+        self._scanning = True
+        threading.Thread(target=self._merge_and_finalize,
+                         args=(unrenamed, new_path, permit, address, sbl, status, lf_path),
+                         daemon=True).start()
+
+    def _merge_category(self, path):
+        """Bucket a staged file for merge ordering. Image files come from the
+        plan scanner; an oversized PDF page is plans unless it's a known
+        oversized form (INSPECTION PROCEDURE sheet); orange folder covers are
+        spotted by their preprinted labels."""
+        if os.path.splitext(path)[1].lower() in _IMAGE_EXTS:
+            return "plans"
+        ft = self.file_class.get(path)
+        if ft is None:
+            ft = self._classify_file(path)
+            self.file_class[path] = ft
+        if ft == "official":
+            return "official"
+        if ft == "application":
+            return "other"
+        try:
+            import fitz
+            doc = fitz.open(path)
+            rect = doc[0].rect
+            oversized = rect.width * rect.height > _LEGAL_AREA * 1.4
+            text = quick_page_text(doc, 0)
+            doc.close()
+        except Exception:
+            return "other"
+        if oversized and not _OVERSIZE_FORM_RE.search(text):
+            return "plans"
+        if _ORANGE_LABEL_RE.search(text):
+            return "orange"
+        return "other"
+
+    def _merge_staged(self, entries, new_path):
+        """Worker-safe: assemble entries' files into one PDF at new_path in
+        filing order (official → other → plans → orange). Deletes merged
+        sources. Returns (merged_entries, component_orig_names)."""
+        import fitz
+        _log = lambda m: self.after(0, self._log, m)
+        for e in entries:
+            e["_cat"] = self._merge_category(e["current"])
+            _log(f"[..] {os.path.basename(e['current'])} → {e['_cat']}")
+        entries.sort(key=lambda e: (_MERGE_ORDER[e["_cat"]],
+                                    os.path.getctime(e["current"]) if os.path.exists(e["current"]) else 0))
+        out = fitz.open()
+        merged = []
+        for e in entries:
+            p = e["current"]
             try:
-                os.utime(sorted_entries[0]["current"], None)
-            except Exception:
-                pass
+                src = fitz.open(p)
+                if src.is_pdf:
+                    out.insert_pdf(src)
+                else:
+                    out.insert_pdf(fitz.open("pdf", src.convert_to_pdf()))
+                src.close()
+                merged.append(e)
+            except Exception as ex:
+                _log(f"[X]  Could not merge {os.path.basename(p)}: {ex} — left in staging, file it separately")
+        if not merged:
+            out.close()
+            return [], []
+        # Save via a temp name: a re-merge can have the previous merged file
+        # (same target path) among its inputs.
+        tmp = new_path + ".tmp"
+        out.save(tmp)
+        out.close()
+        components = []
+        for e in merged:
+            components.extend(e.get("components", [os.path.basename(e["current"])]))
+            try:
+                os.remove(e["current"])
+            except Exception as ex:
+                _log(f"[!]  Could not remove {os.path.basename(e['current'])}: {ex}")
+            e["_merged"] = True
+        os.replace(tmp, new_path)
+        _log(f"[OK] {os.path.basename(new_path)} — {len(merged)} file(s) merged "
+             f"({' → '.join(e['_cat'] for e in merged)})")
+        return merged, components
 
+    def _swap_staged(self, entries, new_path, components, renamed):
+        """UI thread: replace merged staging entries with the single output file."""
+        gone = {id(e) for e in entries if e.get("_merged")}
+        self.staged[:] = [e for e in self.staged if id(e) not in gone]
+        self.staged.append({"current": new_path, "renamed": renamed,
+                            "components": components})
+        self.confirm_btn.config(state="normal")
+
+    def _merge_and_finalize(self, entries, new_path, permit, address, sbl, status, lf_path):
+        """Worker: merge staged files into one ordered PDF, then finish on the UI thread."""
+        try:
+            merged, components = self._merge_staged(entries, new_path)
+            if not merged:
+                self.after(0, self._log, "[X]  Merge produced no pages — nothing confirmed")
+                self.after(0, lambda: self.confirm_btn.config(state="normal"))
+                return
+            pairs = [(c, os.path.basename(new_path)) for c in components]
+            def _finish():
+                self._swap_staged(entries, new_path, components, True)
+                self._finish_confirm(pairs, new_path, permit, address, sbl, status, lf_path)
+            self.after(0, _finish)
+        except Exception as ex:
+            self.after(0, self._log, f"[X]  Merge failed: {ex}")
+            self.after(0, lambda: self.confirm_btn.config(state="normal"))
+        finally:
+            self._scanning = False
+
+    def _finish_confirm(self, renamed_pairs, new_path, permit, address, sbl, status, lf_path):
         append_history(permit, address, sbl, status)
         try:
-            archive_confirm(renamed_pairs, permit, address, sbl, status, self._laserfiche_path())
+            archive_confirm(renamed_pairs, permit, address, sbl, status, lf_path)
         except Exception as e:
             self._log(f"[!]  Archive update failed: {e}")
         self._update_stats()
         self.confirm_btn.config(state="disabled")
-        self._log(f"[--] {len(sorted_entries)} file(s) renamed — drag from staging to Laserfiche")
+        self._log(f"[--] {os.path.basename(new_path)} ready — drag from staging to Laserfiche")
 
     def _new_permit(self):
         unfinished = [e for e in self.staged if not e["renamed"]]
@@ -1470,6 +1624,7 @@ class App(tk.Tk):
                     self._log(f"[!]  Could not delete {os.path.basename(src)}: {e}")
 
         self.staged.clear()
+        self.file_class.clear()
         self._clear_preview()
         self.permit_id.set("")
         self.street_num.set("")
@@ -1937,15 +2092,15 @@ class App(tk.Tk):
     def _recover_staging(self):
         if not os.path.exists(STAGING_FOLDER):
             return
-        pdfs = [os.path.join(STAGING_FOLDER, f) for f in os.listdir(STAGING_FOLDER)
-                if f.lower().endswith(".pdf")]
-        for p in pdfs:
+        files = [os.path.join(STAGING_FOLDER, f) for f in os.listdir(STAGING_FOLDER)
+                 if f.lower().endswith(_STAGE_EXTS)]
+        for p in files:
             if not any(e["current"] == p for e in self.staged):
                 self.staged.append({"current": p, "renamed": False})
                 self._log(f"[..] Recovered: {os.path.basename(p)}")
-        if pdfs:
+        if files:
             self.confirm_btn.config(state="normal")
-            self._log(f"[--] {len(pdfs)} file(s) found in staging from previous session")
+            self._log(f"[--] {len(files)} file(s) found in staging from previous session")
 
     def _reocr_staging(self):
         if self._scanning:
@@ -1956,14 +2111,22 @@ class App(tk.Tk):
              if f.lower().endswith(".pdf")],
             key=os.path.getctime  # oldest first — first file to arrive in staging is tried first
         )
-        if not pdfs:
-            self._log("[!]  No PDFs in staging folder")
+        images = [os.path.join(STAGING_FOLDER, f) for f in os.listdir(STAGING_FOLDER)
+                  if f.lower().endswith(_IMAGE_EXTS)]
+        if not pdfs and not images:
+            self._log("[!]  No files in staging folder")
             return
-        # Register any untracked files (drag-dropped, not from watcher)
-        for p in pdfs:
+        # Register any untracked files (drag-dropped, not from watcher).
+        # Images are staged for the merge but are never a data source.
+        for p in pdfs + images:
             if not any(e["current"] == p for e in self.staged):
                 self.staged.append({"current": p, "renamed": False})
                 self._log(f"[..] Registered: {os.path.basename(p)}")
+        if images:
+            self.confirm_btn.config(state="normal")
+        if not pdfs:
+            self._log("[--] Only image files staged — nothing to OCR")
+            return
         self._scanning = True
         self._set_progress(0)
         self._log(f"[..] Re-OCR: classifying and scanning {len(pdfs)} file(s)...")
@@ -2036,6 +2199,7 @@ class App(tk.Tk):
         buckets: dict[str, list] = {"official": [], "application": [], "unknown": []}
         for path in pdfs:
             ft = self._classify_file(path)
+            self.file_class[path] = ft
             buckets[ft].append(path)
             self.after(0, self._log, f"[..] {os.path.basename(path)} → {_TIER_LABEL[ft]}")
 
