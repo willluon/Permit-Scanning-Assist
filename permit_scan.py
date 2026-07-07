@@ -124,6 +124,79 @@ def extract_text_from_page(doc, page_idx):
     return (native + "\n" + ocr).strip()
 
 
+def quick_ocr_page_type(doc, page_idx):
+    """Single-pass 1.5× Tesseract classification of one page — detection only."""
+    import fitz
+    import pytesseract
+    from PIL import Image
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+    pix  = doc[page_idx].get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+    gray = Image.frombytes("RGB", [pix.width, pix.height], pix.samples).convert("L")
+    try:
+        return detect_permit_type(pytesseract.image_to_string(gray, config="--psm 3 --oem 3"))
+    except Exception:
+        return "unknown"
+
+
+def try_flip_official(doc, page_idx, classify, log=None):
+    """Flip a scanned page 180° and re-classify. The official permit is always
+    the earliest sheet of a batch and is sometimes fed upside-down — never
+    sideways — so an unreadable early page must be flip-checked BEFORE trusting
+    any page after it. If the flip reveals the official permit: keep it,
+    incremental-save, and sweep the rest of the doc so the Laserfiche copy is
+    fully upright. Otherwise the rotation is restored. Returns True on reveal."""
+    orig = doc[page_idx].rotation
+    doc[page_idx].set_rotation((orig + 180) % 360)
+    if classify(doc, page_idx) == "official":
+        if log:
+            log(f"[..] Page {page_idx + 1} was scanned upside-down — flipped it")
+        try:
+            doc.saveIncr()
+        except Exception as e:
+            if log:
+                log(f"[!]  Could not save flip fix to PDF: {e}")
+        fix_upside_down_pages(doc, log=log)
+        return True
+    doc[page_idx].set_rotation(orig)
+    return False
+
+
+def fix_upside_down_pages(doc, pages=None, log=None):
+    """Detect pages scanned in the wrong orientation (Tesseract OSD) and repair
+    the PDF rotation flag in place. Returns the list of fixed page indexes.
+    Renders honor the corrected flag immediately; the incremental save makes it
+    permanent so the copy filed into Laserfiche is upright too.
+    Scanners may already stamp a rotation flag, so OSD's correction is added to
+    the existing value rather than replacing it."""
+    import fitz
+    import pytesseract
+    from PIL import Image
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+    fixed = []
+    for i in (pages if pages is not None else range(len(doc))):
+        page = doc[i]
+        if page.get_text().strip():   # digital text layer — orientation is fine
+            continue
+        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples).convert("L")
+        try:
+            osd  = pytesseract.image_to_osd(img)
+            rot  = int(re.search(r'Rotate:\s*(\d+)', osd).group(1))
+            conf = float(re.search(r'Orientation confidence:\s*([\d.]+)', osd).group(1))
+        except Exception:
+            continue   # blank or handwritten page — OSD can't tell, leave it alone
+        if rot and conf >= 5.0:
+            page.set_rotation((page.rotation + rot) % 360)
+            fixed.append(i)
+    if fixed:
+        try:
+            doc.saveIncr()
+        except Exception as e:
+            if log:
+                log(f"[!]  Could not save rotation fix to PDF: {e}")
+    return fixed
+
+
 def preprocess_for_ocr(img):
     from PIL import ImageEnhance, ImageFilter
     img = img.convert("L")
@@ -1128,8 +1201,14 @@ class App(tk.Tk):
         _ocr_pct = [40, 60, 75]
         if official_idx is None:
             self.after(0, self._log, "[..] No official permit in native text — scanning pages with OCR...")
+            _wlog = lambda m: self.after(0, self._log, m)
             for i in range(num_pages):
                 ptype = detect_permit_type(extract_text_from_page(doc, i))
+                # Unreadable scanned page: flip-check it before trusting any
+                # later page — the official permit is always the earliest sheet
+                if ptype == "unknown" and not doc[i].get_text().strip():
+                    if try_flip_official(doc, i, quick_ocr_page_type, log=_wlog):
+                        ptype = "official"
                 self.after(0, self._set_progress, _ocr_pct[i])
                 if ptype == "official":
                     official_idx = i
@@ -1919,20 +1998,21 @@ class App(tk.Tk):
             if fallback == "application":
                 doc.close()
                 return "application"
-            # Quick single-pass OCR — cheaper than full dual-pass used during extraction
+            # Quick single-pass OCR — cheaper than full dual-pass used during extraction.
+            # An unreadable scanned page gets flip-checked immediately: a
+            # flipped official on page 1 must win over anything on later pages.
+            _wlog = lambda m: self.after(0, self._log, m)
             for i in range(num_pages):
-                pix  = doc[i].get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
-                gray = Image.frombytes("RGB", [pix.width, pix.height], pix.samples).convert("L")
-                try:
-                    text = pytesseract.image_to_string(gray, config="--psm 3 --oem 3")
-                    pt = detect_permit_type(text)
-                    if pt == "official":
+                pt = quick_ocr_page_type(doc, i)
+                if pt == "unknown" and not doc[i].get_text().strip():
+                    if try_flip_official(doc, i, quick_ocr_page_type, log=_wlog):
                         doc.close()
                         return "official"
-                    elif pt == "application":
-                        fallback = "application"
-                except Exception:
-                    pass
+                if pt == "official":
+                    doc.close()
+                    return "official"
+                elif pt == "application":
+                    fallback = "application"
             doc.close()
             return fallback
         except Exception:
