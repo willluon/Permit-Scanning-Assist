@@ -353,14 +353,22 @@ def parcel_lookup_address(num, street):
     return None
 
 
+# Abbreviated street suffixes get a period in Laserfiche ("CROW HILL RD.",
+# "MOHANSIC AVE. EAST"); spelled-out endings ("OLD COUNTRY WAY") do not.
+# Never dot the first word — "LA VOIE CT" starts with LA as a real word.
+_LF_ABBREV_SUFFIXES = {"RD", "ST", "AVE", "DR", "LA", "LN", "CT", "PL", "CR",
+                       "BLVD", "TERR", "TER", "PKWY", "TR", "EST", "CIR", "HWY", "EXT"}
+
+
 def laserfiche_path_for(num, street):
     """Laserfiche folder path for an address (module-level so lookups can use it)."""
     num = str(num or "").strip()
-    st  = (street or "").strip().upper().rstrip('.')
-    if not num or not st:
+    words = [w.rstrip('.') for w in (street or "").strip().upper().split()]
+    if not num or not words:
         return ""
-    st_p = st + "."   # Laserfiche convention: "CROW HILL RD."
-    return rf"TownOfYorktown\Building Department\Parcels\{st[0]}\{st_p}\{num} {st_p}"
+    st_p = " ".join(w + "." if i and w in _LF_ABBREV_SUFFIXES else w
+                    for i, w in enumerate(words))
+    return rf"TownOfYorktown\Building Department\Parcels\{st_p[0]}\{st_p}\{num} {st_p}"
 
 
 def parcel_search(query, limit=60):
