@@ -468,11 +468,14 @@ def laserfiche_path_for(num, street):
     """Laserfiche folder path for an address (module-level so lookups can use it)."""
     num = str(num or "").strip()
     words = [w.rstrip('.') for w in (street or "").strip().upper().split()]
-    if not num or not words:
+    if not words:
         return ""
     st_p = " ".join(w + "." if i and w in _LF_ABBREV_SUFFIXES else w
                     for i, w in enumerate(words))
-    return rf"TownOfYorktown\Building Department\Parcels\{st_p[0]}\{st_p}\{num} {st_p}"
+    # No street number: the parcel folder is named after the street itself
+    # ("...\D\DARBY ST.\DARBY ST.").
+    leaf = f"{num} {st_p}" if num else st_p
+    return rf"TownOfYorktown\Building Department\Parcels\{st_p[0]}\{st_p}\{leaf}"
 
 
 def parcel_search(query, limit=60):
@@ -1998,7 +2001,9 @@ class App(tk.Tk):
             if not p or not p["address"]:
                 return ""
             m = re.match(r'^(\d+)\s+(.+)$', p["address"])
-            return laserfiche_path_for(m.group(1), m.group(2)) if m else ""
+            if m:
+                return laserfiche_path_for(m.group(1), m.group(2))
+            return laserfiche_path_for("", p["address"])
 
         def _copy_lf():
             path = _lf_path_for_selected()
