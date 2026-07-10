@@ -99,9 +99,11 @@ def detect_permit_type(text):
 
 
 
-def extract_text_from_page(doc, page_idx):
+def extract_text_from_page(doc, page_idx, printed=False):
     """Tesseract OCR a single already-open fitz page; combines native + OCR text.
-    PyMuPDF applies PDF page rotation automatically when rendering — do NOT re-rotate."""
+    PyMuPDF applies PDF page rotation automatically when rendering — do NOT re-rotate.
+    printed=True: the page is a known printed form — grayscale PSM 3/6 only,
+    since contrast enhancement and PSM 11 help handwriting but degrade clean print."""
     import fitz
     import pytesseract
     from PIL import Image
@@ -114,6 +116,10 @@ def extract_text_from_page(doc, page_idx):
 
     # Pass A: grayscale only — best for clean printed scans
     img_gray = Image.open(io.BytesIO(png_bytes)).convert("L")
+    if printed:
+        ocr = ocr_image(img_gray, pytesseract,
+                        configs=["--oem 1 --psm 3", "--oem 1 --psm 6"])
+        return (native + "\n" + ocr).strip()
     ocr_a = ocr_image(img_gray, pytesseract)
 
     # Pass B: contrast-enhanced — better for faint handwritten text
@@ -125,20 +131,23 @@ def extract_text_from_page(doc, page_idx):
 
 
 def quick_page_text(doc, page_idx):
-    """Cheap text for one page: native layer if present, else single-pass 1.5× Tesseract."""
+    """Cheap text for one page: native layer if substantial, else single-pass
+    1.5× Tesseract. A few stray native characters (scanner artifacts) are not
+    enough to classify on — those pages still get OCR'd."""
     import fitz
     import pytesseract
     from PIL import Image
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
     native = doc[page_idx].get_text().strip()
-    if native:
+    if len(native) > 40:
         return native
     pix  = doc[page_idx].get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
     gray = Image.frombytes("RGB", [pix.width, pix.height], pix.samples).convert("L")
     try:
-        return pytesseract.image_to_string(gray, config="--psm 3 --oem 3")
+        ocr = pytesseract.image_to_string(gray, config="--psm 3 --oem 3")
     except Exception:
-        return ""
+        ocr = ""
+    return (native + "\n" + ocr).strip()
 
 
 def quick_ocr_page_type(doc, page_idx):
@@ -158,6 +167,11 @@ _LEGAL_AREA  = 612 * 1008   # 8.5×14 in PDF points — anything well past this 
 _OVERSIZE_FORM_RE = re.compile(r'INSPECTION\s+PROCEDURE', re.IGNORECASE)
 # Orange folder cover labels (preprinted, so Tesseract reads them reliably)
 _ORANGE_LABEL_RE  = re.compile(r'BLDG\.?\s*PER|LOCATION\s+OF\s+PROJECT', re.IGNORECASE)
+
+
+def _plan_sized(page):
+    """Plan-sheet-sized page — never a permit form, and slow to OCR."""
+    return page.rect.width * page.rect.height > _LEGAL_AREA * 1.4
 
 
 def try_flip_official(doc, page_idx, classify, log=None):
@@ -231,11 +245,14 @@ def _ascii_score(t):
     return sum(1 for c in t if c.isascii() and (c.isalnum() or c in ' \n.,:-#/'))
 
 
-def ocr_image(img, pytesseract):
-    cfg3  = "--oem 1 --psm 3"   # LSTM + auto layout detection (good for forms)
-    cfg6  = "--oem 1 --psm 6"   # LSTM + uniform block
-    cfg11 = "--oem 1 --psm 11"  # LSTM + sparse/handwritten layout
-    results = [pytesseract.image_to_string(img, config=c) for c in [cfg3, cfg6, cfg11]]
+def ocr_image(img, pytesseract, configs=None):
+    if configs is None:
+        configs = [
+            "--oem 1 --psm 3",   # LSTM + auto layout detection (good for forms)
+            "--oem 1 --psm 6",   # LSTM + uniform block
+            "--oem 1 --psm 11",  # LSTM + sparse/handwritten layout
+        ]
+    results = [pytesseract.image_to_string(img, config=c) for c in configs]
     return max(results, key=_ascii_score)
 
 
@@ -1221,14 +1238,17 @@ class App(tk.Tk):
         """Run full extraction on a PDF. Returns (permit, num, street, sbl). Safe to call from any thread."""
         import fitz
         doc = fitz.open(path)
-        num_pages = min(3, len(doc))
+        total_pages = len(doc)
+        # The official permit is always the earliest sheet — flip-checks and
+        # the full-power fallback never look past the front of the doc.
+        flip_window = min(3, total_pages)
 
         self.after(0, self._set_progress, 5)
 
         # Pass 1: native text page detection (instant for digital PDFs)
         official_idx = None
         application_idx = None
-        for i in range(num_pages):
+        for i in range(total_pages):
             ptype = detect_permit_type(doc[i].get_text())
             if ptype == "official" and official_idx is None:
                 official_idx = i
@@ -1237,20 +1257,50 @@ class App(tk.Tk):
 
         self.after(0, self._set_progress, 20)
 
-        # Pass 2: if official permit not yet found, OCR-scan pages to look for it.
-        # Runs even when application was found in Pass 1 — official always wins.
-        _ocr_pct = [40, 60, 75]
+        # Pass 2: official not in native text — quick OCR sweep (1.5×, single
+        # pass) over every page, front to back. Cheap enough to cover the whole
+        # doc; the expensive dual-pass OCR runs only on the chosen target page.
+        # Also remembers the first orange-folder page so an unknown batch
+        # extracts from the cover sheet wherever it sits, not page 1.
+        orange_idx = None
         if official_idx is None:
-            self.after(0, self._log, "[..] No official permit in native text — scanning pages with OCR...")
+            self.after(0, self._log, "[..] No official permit in native text — quick-scanning pages...")
             _wlog = lambda m: self.after(0, self._log, m)
-            for i in range(num_pages):
-                ptype = detect_permit_type(extract_text_from_page(doc, i))
-                # Unreadable scanned page: flip-check it before trusting any
+            for i in range(total_pages):
+                if len(doc[i].get_text().strip()) > 40:
+                    continue   # substantial native text — already classified in Pass 1
+                if _plan_sized(doc[i]):
+                    continue   # plan sheet — never a permit, slow to OCR
+                text  = quick_page_text(doc, i)
+                ptype = detect_permit_type(text)
+                # Unreadable early page: flip-check it before trusting any
                 # later page — the official permit is always the earliest sheet
-                if ptype == "unknown" and not doc[i].get_text().strip():
+                if ptype == "unknown" and i < flip_window:
                     if try_flip_official(doc, i, quick_ocr_page_type, log=_wlog):
                         ptype = "official"
-                self.after(0, self._set_progress, _ocr_pct[i])
+                self.after(0, self._set_progress, 20 + int(45 * (i + 1) / total_pages))
+                if ptype == "official":
+                    official_idx = i
+                    break
+                if ptype == "application" and application_idx is None:
+                    application_idx = i
+                if orange_idx is None and _ORANGE_LABEL_RE.search(text):
+                    orange_idx = i
+
+        # Fallback: a faint scan can defeat the quick pass yet still be readable
+        # by the full dual-pass OCR — re-check the front pages at full power
+        # before concluding there is no official permit. Bounds the worst case
+        # at roughly the old behavior plus the quick sweep.
+        if official_idx is None:
+            _fb_logged = False
+            for i in range(flip_window):
+                if len(doc[i].get_text().strip()) > 40 or _plan_sized(doc[i]):
+                    continue
+                if not _fb_logged:
+                    self.after(0, self._log, "[..] Quick scan found no permit — retrying first pages at full power...")
+                    _fb_logged = True
+                ptype = detect_permit_type(extract_text_from_page(doc, i))
+                self.after(0, self._set_progress, 65 + int(15 * (i + 1) / flip_window))
                 if ptype == "official":
                     official_idx = i
                     break
@@ -1267,7 +1317,10 @@ class App(tk.Tk):
             doc.close()
             return "", "", "", "", {"permit": "", "address": "", "sbl": "", "form_type": "application", "form_page": application_idx + 1}
         else:
-            target, permit_type = 0, "unknown"
+            # No recognizable form anywhere: extract from the orange folder
+            # cover if the quick sweep spotted one, else page 1
+            target = orange_idx if orange_idx is not None else 0
+            permit_type = "unknown"
 
         self.after(0, self._log, f"[..] Form type: {permit_type} (page {target + 1})")
         self.file_class[path] = permit_type
@@ -1285,7 +1338,7 @@ class App(tk.Tk):
         if len(native_text.strip()) > 80:
             text = native_text
         else:
-            text = extract_text_from_page(doc, target)
+            text = extract_text_from_page(doc, target, printed=(permit_type == "official"))
         self.last_ocr_text = text
         self._archive_scan_text(doc, path, text, permit_type)
 
@@ -2153,10 +2206,11 @@ class App(tk.Tk):
             import fitz
             from PIL import Image
             doc = fitz.open(path)
-            num_pages = min(3, len(doc))
+            total_pages = len(doc)
+            flip_window = min(3, total_pages)
             fallback = "unknown"
             # Native text pass — instant for digital PDFs
-            for i in range(num_pages):
+            for i in range(total_pages):
                 pt = detect_permit_type(doc[i].get_text())
                 if pt == "official":
                     doc.close()
@@ -2166,13 +2220,16 @@ class App(tk.Tk):
             if fallback == "application":
                 doc.close()
                 return "application"
-            # Quick single-pass OCR — cheaper than full dual-pass used during extraction.
-            # An unreadable scanned page gets flip-checked immediately: a
-            # flipped official on page 1 must win over anything on later pages.
+            # Quick single-pass OCR — cheaper than full dual-pass used during
+            # extraction. Plan-sized pages are never permits — skipped. An
+            # unreadable early page gets flip-checked immediately: a flipped
+            # official on page 1 must win over anything on later pages.
             _wlog = lambda m: self.after(0, self._log, m)
-            for i in range(num_pages):
+            for i in range(total_pages):
+                if len(doc[i].get_text().strip()) > 40 or _plan_sized(doc[i]):
+                    continue
                 pt = quick_ocr_page_type(doc, i)
-                if pt == "unknown" and not doc[i].get_text().strip():
+                if pt == "unknown" and i < flip_window:
                     if try_flip_official(doc, i, quick_ocr_page_type, log=_wlog):
                         doc.close()
                         return "official"
