@@ -83,12 +83,20 @@ _OFFICIAL_PERMIT_TYPES = re.compile(
     re.IGNORECASE,
 )
 
+# INSPECTION PROCEDURE info sheets carry "Building Permit" + the Yorktown
+# letterhead, so they false-positive as official — which ends the page sweep
+# before a real permit deeper in the batch is reached. (Also the known
+# oversized-but-not-a-plan form in merge categorization.)
+_INSPECTION_SHEET_RE = re.compile(r'INSPECTION\s+PROCEDURE', re.IGNORECASE)
+
 def detect_permit_type(text):
     upper = text.upper()
     # Application check FIRST — application forms contain "BUILDING PERMIT" + Yorktown markers
     # which would otherwise match the official check below.
     if re.search(r'APPLICATION\s+FOR\s+(?:A\s+)?BUILDING\s+PERMIT', upper):
         return "application"
+    if _INSPECTION_SHEET_RE.search(upper):
+        return "unknown"
     if _OFFICIAL_PERMIT_TYPES.search(upper) and (
         re.search(r'TOWN\s+OF\s+YORKTOWN', upper) or
         re.search(r'BUILDING\s+DEPARTMENT', upper) or
@@ -163,8 +171,6 @@ _IMAGE_EXTS  = ('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp')
 _STAGE_EXTS  = ('.pdf',) + _IMAGE_EXTS
 _MERGE_ORDER = {"official": 0, "other": 1, "plans": 2, "orange": 3}
 _LEGAL_AREA  = 612 * 1008   # 8.5×14 in PDF points — anything well past this is plan-sized
-# Oversized sheets that are regular documents, NOT building plans
-_OVERSIZE_FORM_RE = re.compile(r'INSPECTION\s+PROCEDURE', re.IGNORECASE)
 # Orange folder cover labels (preprinted, so Tesseract reads them reliably)
 _ORANGE_LABEL_RE  = re.compile(r'BLDG\.?\s*PER|LOCATION\s+OF\s+PROJECT', re.IGNORECASE)
 
@@ -172,6 +178,45 @@ _ORANGE_LABEL_RE  = re.compile(r'BLDG\.?\s*PER|LOCATION\s+OF\s+PROJECT', re.IGNO
 def _plan_sized(page):
     """Plan-sheet-sized page — never a permit form, and slow to OCR."""
     return page.rect.width * page.rect.height > _LEGAL_AREA * 1.4
+
+
+def _orange_cover_page(page):
+    """Orange-folder cover detected by paper color. Covers laid flat on the
+    11x17 plan scanner come out plan-sized, so the OCR sweeps skip them and
+    the label regex never runs — but the orange paper itself is unmistakable.
+    Renders a thumbnail and counts orange-hued pixels."""
+    import fitz
+    try:
+        pix = page.get_pixmap(matrix=fitz.Matrix(0.15, 0.15))
+    except Exception:
+        return False
+    if pix.n < 3:
+        return False
+    s, n = pix.samples, pix.n
+    total = pix.width * pix.height
+    if not total:
+        return False
+    hits = 0
+    for i in range(0, total * n, n):
+        r, g, b = s[i], s[i + 1], s[i + 2]
+        if r > 140 and r - b > 50 and b + 15 < g < r:
+            hits += 1
+    return hits / total > 0.35
+
+
+def _claude_page_png(page, zoom):
+    """Render a page for the Claude API, keeping the PNG under the 5 MB image
+    limit — a plan-sized orange folder at 3× is ~9 MB and gets rejected with a
+    400. Long side capped at ~2400 px (the API downscales past ~1600 px anyway,
+    so oversized scans lose nothing), then steps down if the PNG is still big."""
+    import fitz
+    long_pts = max(page.rect.width, page.rect.height) or 1
+    z = min(zoom, 2400 / long_pts)
+    while True:
+        png = page.get_pixmap(matrix=fitz.Matrix(z, z)).tobytes("png")
+        if len(png) <= 4_500_000 or z <= 0.5:
+            return png
+        z *= 0.8
 
 
 def try_flip_official(doc, page_idx, classify, log=None):
@@ -1270,6 +1315,11 @@ class App(tk.Tk):
                 if len(doc[i].get_text().strip()) > 40:
                     continue   # substantial native text — already classified in Pass 1
                 if _plan_sized(doc[i]):
+                    # Orange folder scanned flat on the plan scanner: plan-sized,
+                    # but still the extraction failsafe — spot it by paper color
+                    if orange_idx is None and _orange_cover_page(doc[i]):
+                        orange_idx = i
+                        self.after(0, self._log, f"[..] Orange folder cover spotted on page {i + 1} (by color)")
                     continue   # plan sheet — never a permit, slow to OCR
                 text  = quick_page_text(doc, i)
                 ptype = detect_permit_type(text)
@@ -1380,9 +1430,8 @@ class App(tk.Tk):
                     # Handwritten forms need higher zoom + a stronger model to read reliably
                     zoom  = 3.0 if handwritten else 2.0
                     cl_model = "claude-sonnet-4-6" if handwritten else "claude-haiku-4-5-20251001"
-                    pix = doc[target].get_pixmap(matrix=fitz.Matrix(zoom, zoom))
                     cl_permit, cl_address, cl_sbl = extract_fields_with_claude(
-                        pix.tobytes("png"), api_key, app_no=app_no, model=cl_model)
+                        _claude_page_png(doc[target], zoom), api_key, app_no=app_no, model=cl_model)
                     self.after(0, self._log, f"[..] Claude returned permit='{cl_permit}' address='{cl_address}' sbl='{cl_sbl}'")
                     cl_permit_digits = re.sub(r'\D', '', cl_permit)
                     permit_slot_open = not permit or (handwritten and sources["permit"] == "tesseract_hw")
@@ -1570,12 +1619,13 @@ class App(tk.Tk):
             doc = fitz.open(path)
             rect = doc[0].rect
             oversized = rect.width * rect.height > _LEGAL_AREA * 1.4
+            orange_paper = oversized and _orange_cover_page(doc[0])
             text = quick_page_text(doc, 0)
             doc.close()
         except Exception:
             return "other"
-        if oversized and not _OVERSIZE_FORM_RE.search(text):
-            return "plans"
+        if oversized and not _INSPECTION_SHEET_RE.search(text):
+            return "orange" if orange_paper else "plans"
         if _ORANGE_LABEL_RE.search(text):
             return "orange"
         return "other"
