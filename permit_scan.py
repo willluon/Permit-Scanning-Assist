@@ -30,7 +30,7 @@ IGNORE_ADDRESSES = ["363 UNDERHILL AVE"]
 # elec_cert / plan_review = fallback pages elsewhere in the batch — lowest rank,
 #                fill-only (can never displace another source), county reconcile gatekeeps
 _SOURCE_RANK = {"parcel": 5, "native": 4, "tesseract": 3, "claude": 2,
-                "tesseract_hw": 1, "elec_cert": 1, "plan_review": 1, "": 0}
+                "tesseract_hw": 1, "elec_cert": 1, "plan_review": 1, "history": 1, "": 0}
 _SRC_STYLE   = {
     "parcel":       ("county",     "#00695c"),
     "native":       ("text",       "#2e7d32"),
@@ -39,6 +39,7 @@ _SRC_STYLE   = {
     "tesseract_hw": ("ocr?",       "#92400e"),
     "elec_cert":    ("cert ←verify","#6a1b9a"),
     "plan_review":  ("plan ←verify","#6a1b9a"),
+    "history":      ("hist ←verify","#00838f"),
 }
 
 def _load_known_streets():
@@ -693,16 +694,24 @@ def reconcile_with_parcels(num, street, sbl, sources, log):
     Returns possibly-updated (num, street, sbl, sources).
     """
     if not parcel_db_available():
+        log("[--] County check skipped — parcel database not found")
         return num, street, sbl, sources
+
+    # Every reconcile run must say SOMETHING — the silent paths made it look
+    # like the county check wasn't running at all.
+    said = []
+    def say(msg):
+        said.append(msg)
+        log(msg)
 
     addr_hit = parcel_lookup_address(num, street) if (num and street) else None
     if addr_hit and _norm_street_key(street) != addr_hit[1]:
-        log(f"[..] Street corrected from county data: '{street}' → '{addr_hit[1]}'")
+        say(f"[..] Street corrected from county data: '{street}' → '{addr_hit[1]}'")
         street = addr_hit[1]
 
     sbl_hit = parcel_lookup_sbl(sbl) if sbl else None
     if sbl and sbl_hit and sbl_hit[0] != re.sub(r'\s+', '', sbl):
-        log(f"[..] SBL repaired from county data: '{sbl}' → '{sbl_hit[0]}'")
+        say(f"[..] SBL repaired from county data: '{sbl}' → '{sbl_hit[0]}'")
         sbl = sbl_hit[0]
 
     # Address didn't resolve to any parcel (garbled/truncated street) but the SBL
@@ -711,40 +720,53 @@ def reconcile_with_parcels(num, street, sbl, sources, log):
     if sbl_hit and not addr_hit and num and street and sbl_hit[1]:
         m = re.match(r'^(\d+)\s+(.+)$', sbl_hit[1])
         if m and m.group(1) == str(num):
-            log(f"[..] Street repaired from county data (via SBL): '{street}' → '{m.group(2)}'")
+            say(f"[..] Street repaired from county data (via SBL): '{street}' → '{m.group(2)}'")
             street = m.group(2)
             sources["address"] = "parcel"
             addr_hit = (sbl_hit[0], m.group(2))
         elif m:
-            log(f"[!]  Address '{num} {street}' not in county data; SBL {sbl_hit[0]} "
+            say(f"[!]  Address '{num} {street}' not in county data; SBL {sbl_hit[0]} "
                 f"belongs to {sbl_hit[1]} — verify")
 
     if sbl and not sbl_hit:
         if addr_hit:
-            log(f"[!]  SBL '{sbl}' not in county data — using {addr_hit[0]} (from address) instead")
+            say(f"[!]  SBL '{sbl}' not in county data — using {addr_hit[0]} (from address) instead")
             sbl = addr_hit[0]
             sources["sbl"] = "parcel"
         else:
-            log(f"[!]  SBL '{sbl}' not found in county parcel data — verify")
+            say(f"[!]  SBL '{sbl}' not found in county parcel data — verify")
     elif sbl and sbl_hit and addr_hit and sbl_hit[0] != addr_hit[0]:
-        log(f"[!]  SBL/address conflict: form says {sbl_hit[0]}, county lists "
+        say(f"[!]  SBL/address conflict: form says {sbl_hit[0]}, county lists "
             f"{num} {street} as {addr_hit[0]} — verify before filing")
 
     if not sbl and addr_hit:
         sbl = addr_hit[0]
         sources["sbl"] = "parcel"
-        log(f"[OK] SBL filled from county parcel data: {sbl}")
+        say(f"[OK] SBL filled from county parcel data: {sbl}")
 
     if not street and sbl_hit and sbl_hit[1]:
         m = re.match(r'^(\d+)\s+(.+)$', sbl_hit[1])
         if m:
             num, street = m.group(1), m.group(2)
             sources["address"] = "parcel"
-            log(f"[OK] Address filled from county parcel data: {num} {street}")
+            say(f"[OK] Address filled from county parcel data: {num} {street}")
 
     # Make a clean verification visible — silent success looks like nothing ran
     if sbl and addr_hit and sbl == addr_hit[0]:
-        log(f"[OK] Verified against county parcels: {num} {street} = {sbl}")
+        say(f"[OK] Verified against county parcels: {num} {street} = {sbl}")
+
+    # Cover the formerly-silent paths: reconcile always reports its outcome
+    if not said:
+        if not sbl and not (num and street):
+            say("[--] County check: nothing extracted to check against")
+        elif sbl_hit and not addr_hit:
+            say(f"[--] County check: SBL {sbl_hit[0]} is a real parcel; "
+                "address could not be cross-checked — verify address")
+        elif (num and street) and not sbl:
+            say(f"[--] County check: '{num} {street}' has no exact county match "
+                "and no SBL to cross-check — verify")
+        else:
+            say("[--] County check ran — nothing conclusive")
 
     return num, street, sbl, sources
 
@@ -940,6 +962,33 @@ def archive_confirm(renamed_pairs, permit, address, sbl, status, lf_path):
                                VALUES (?,?,?,?,?,?,?,?,?)""",
                             (now, now, orig, final, permit, address, sbl, status, lf_path))
         con.commit()
+    finally:
+        con.close()
+
+
+def history_lookup_permit(permit_id):
+    """Permit → property memory: distinct parcels this permit was confirmed-filed
+    under. Returns [(address, sbl, last_confirmed_at, final_name)], newest first.
+    Exactly one row = safe to auto-fill (with verify flag); more = ambiguous, abstain."""
+    con = _archive_con()
+    try:
+        return con.execute("""
+            SELECT address, sbl, MAX(confirmed_at), final_name FROM scans
+            WHERE permit_id=? AND confirmed_at IS NOT NULL AND ifnull(sbl,'')<>''
+            GROUP BY sbl ORDER BY 3 DESC""", (permit_id,)).fetchall()
+    finally:
+        con.close()
+
+
+def history_prior_filings(permit_id):
+    """Confirmed filings of this permit: [(final_name, confirmed_at, status, lf_path)],
+    newest first. Used by the duplicate check — a hit may be a legitimate REVISED rescan."""
+    con = _archive_con()
+    try:
+        return con.execute("""
+            SELECT final_name, MAX(confirmed_at), status, lf_path FROM scans
+            WHERE permit_id=? AND confirmed_at IS NOT NULL AND ifnull(final_name,'')<>''
+            GROUP BY final_name ORDER BY 2 DESC""", (permit_id,)).fetchall()
     finally:
         con.close()
 
@@ -1564,6 +1613,32 @@ class App(tk.Tk):
             except Exception as e:
                 self.after(0, self._log, f"[!]  Fallback sweep error: {e}")
 
+        # History fill: permit → property memory. Confirmed filings only, exact
+        # 8-digit match, single-parcel matches only (ambiguity = abstain), SBL
+        # must be a real county parcel, and county reconcile still gatekeeps.
+        if permit and (not address or not sbl):
+            try:
+                hist = history_lookup_permit(permit)
+                if len(hist) == 1:
+                    h_addr, h_sbl, h_when, _fn = hist[0]
+                    when = (h_when or "")[:10]
+                    if not sbl and h_sbl and parcel_db_available() and parcel_lookup_sbl(h_sbl):
+                        sbl = h_sbl
+                        sources["sbl"] = "history"
+                        self.after(0, self._log,
+                                   f"[..] History: SBL {h_sbl} from prior filing of permit {permit} ({when}) — verify")
+                    if not address and h_addr:
+                        address = h_addr
+                        sources["address"] = "history"
+                        self.after(0, self._log,
+                                   f"[..] History: address '{h_addr}' from prior filing of permit {permit} ({when}) — verify")
+                elif len(hist) > 1:
+                    opts = "; ".join(f"{a or '?'} ({s})" for a, s, _w, _f in hist[:4])
+                    self.after(0, self._log,
+                               f"[!]  History: permit {permit} maps to multiple parcels — not auto-filling: {opts}")
+            except Exception as e:
+                self.after(0, self._log, f"[!]  History lookup error: {e}")
+
         doc.close()
         num, street = split_address(address) if address else ("", "")
         if street:
@@ -1659,15 +1734,31 @@ class App(tk.Tk):
             self._log("[!]  Enter a Permit ID before confirming")
             return
 
-        # Duplicate detection — warn if this permit ID appears in history
-        prior = [e for e in load_history() if e.get("permit_id", "").startswith(permit[:8])]
-        if prior:
-            last = prior[0]
+        # Duplicate detection — archive first (filenames/dates/status), JSON
+        # history as fallback. A hit is often legitimate: permits get rescanned
+        # as REVISED versions when info changes — so ask, never block.
+        try:
+            prior_filings = history_prior_filings(permit)
+        except Exception:
+            prior_filings = []
+        if prior_filings:
+            lines = "\n".join(f"   {fn}   ({(when or '')[:10]}{',  ' + st if st else ''})"
+                              for fn, when, st, _lf in prior_filings[:5])
             if not messagebox.askyesno(
-                    "Duplicate Permit",
-                    f"Permit {permit} was already filed on {last['date']}.\n"
-                    f"Address on file: {last.get('address', '—')}\n\nFile it again?"):
+                    "Permit Already Filed",
+                    f"Permit {permit} is already in the archive:\n\n{lines}\n\n"
+                    "File this batch anyway?\n"
+                    "(Yes is correct if this is a REVISED version or additional pages.)"):
                 return
+        else:
+            prior = [e for e in load_history() if e.get("permit_id", "").startswith(permit[:8])]
+            if prior:
+                last = prior[0]
+                if not messagebox.askyesno(
+                        "Duplicate Permit",
+                        f"Permit {permit} was already filed on {last['date']}.\n"
+                        f"Address on file: {last.get('address', '—')}\n\nFile it again?"):
+                    return
 
         unrenamed = [e for e in self.staged if not e["renamed"]]
         if not unrenamed:
@@ -2503,6 +2594,17 @@ class App(tk.Tk):
             else:
                 self.after(0, self._log,
                            "[!]  PERMIT ID NOT FOUND after all tiers — check the pages and enter it manually before confirming")
+        else:
+            # Early duplicate heads-up — Confirm asks again, but say it now
+            try:
+                _prior = history_prior_filings(best_permit)
+                if _prior:
+                    _fn, _when, _st, _lf = _prior[0]
+                    self.after(0, self._log,
+                               f"[i]  Permit {best_permit} was filed before: {_fn} ({(_when or '')[:10]}) — "
+                               "expected if this batch is a REVISED version")
+            except Exception:
+                pass
 
         best_sources["form_type"] = best_form_type
         best_sources["form_page"] = best_form_page
