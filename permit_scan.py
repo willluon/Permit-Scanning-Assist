@@ -27,13 +27,18 @@ IGNORE_ADDRESSES = ["363 UNDERHILL AVE"]
 # Source tracking
 # tesseract_hw = Tesseract on handwriting — less reliable than Claude for numeric fields
 # parcel       = county GIS parcel data (yorktown_parcels.db) — authoritative, outranks everything
-_SOURCE_RANK = {"parcel": 5, "native": 4, "tesseract": 3, "claude": 2, "tesseract_hw": 1, "": 0}
+# elec_cert / plan_review = fallback pages elsewhere in the batch — lowest rank,
+#                fill-only (can never displace another source), county reconcile gatekeeps
+_SOURCE_RANK = {"parcel": 5, "native": 4, "tesseract": 3, "claude": 2,
+                "tesseract_hw": 1, "elec_cert": 1, "plan_review": 1, "": 0}
 _SRC_STYLE   = {
     "parcel":       ("county",     "#00695c"),
     "native":       ("text",       "#2e7d32"),
     "tesseract":    ("ocr",        "#e65100"),
     "claude":       ("ai  ←verify","#1565c0"),
     "tesseract_hw": ("ocr?",       "#92400e"),
+    "elec_cert":    ("cert ←verify","#6a1b9a"),
+    "plan_review":  ("plan ←verify","#6a1b9a"),
 }
 
 def _load_known_streets():
@@ -202,6 +207,75 @@ def _orange_cover_page(page):
         if r > 140 and r - b > 50 and b + 15 < g < r:
             hits += 1
     return hits / total > 0.35
+
+
+# ── Fallback data sources (added 2026-07-22) ──────────────────────────────────
+# Census over 1,222 scanned batches showed two printed page types that reliably
+# carry parcel info when the permit/orange cover fail: electrical inspection
+# certificates ("Located at {site}", Section/Block/Lot — SBL agreed with the
+# official permit 90 times in validation, and the disagreements were OCR garbage
+# the county reconcile rejects) and plan-review list pages ("... CONSTRUCTION
+# PROPOSED AT {address}", typed). Both rank below every other source and only
+# fill still-empty fields. A cert's own application/certificate number mimics a
+# permit ID and was one-digit-off wrong 3/23 times — permit from a cert is
+# logged as a suggestion, never filled.
+_ELEC_CERT_RE = re.compile(
+    r'BOARD\s+OF\s+FIRE\s+UNDERWRITERS|BUREAU\s+OF\s+ELECTRICITY|ELECTRICAL\s+INSPECTION',
+    re.IGNORECASE)
+# Plan-review letters phrase it many ways ("the work proposed at X", "the
+# construction proposed at X", "plan review list for the ... proposed at X");
+# the stable anchor is "proposed at {number street}". OCR sometimes splits
+# number and street across a comma/newline ("395,\nSaber Court").
+_PLAN_REVIEW_ADDR_RE = re.compile(
+    r'PROPOSED\s+AT[:\s]*(\d+\s*,?\s*[A-Za-z][^\n]{2,60})',
+    re.IGNORECASE)
+
+
+def _trim_site_address(addr):
+    """Cut a captured address down to 'number street': drop town/state/zip tail,
+    stop at the street suffix."""
+    addr = re.sub(r'\s+', ' ', addr)                       # collapse newlines from wrapped lines
+    addr = re.sub(r'^(\d+)\s*,\s*', r'\1 ', addr)          # OCR comma after the house number
+    addr = re.sub(r',?\s*(Yorktown|New York|NY|\d{5}).*$', '', addr, flags=re.IGNORECASE).strip()
+    m = re.search(rf'\b({STREET_SUFFIXES})\b\.?', addr, re.IGNORECASE)
+    if m:
+        addr = addr[:m.end()].strip().rstrip(',.')
+    return addr.strip()
+
+
+def _sweep_fallback_pages(doc, exclude_idx):
+    """Quick-scan the file's other pages for electrical certs / plan-review
+    lists. Returns a dict with any of: "address" -> (value, source, page_1based),
+    "sbl" -> (value, "elec_cert", page), "permit_hint" -> (value, page)."""
+    out = {}
+    for i in range(len(doc)):
+        if i == exclude_idx or _plan_sized(doc[i]):
+            continue
+        text = quick_page_text(doc, i)
+        if _ELEC_CERT_RE.search(text):
+            if "address" not in out:
+                m = re.search(r'LOCATED\s+AT[:\s]+(\d[^\n]{3,70})', text, re.IGNORECASE)
+                if m:
+                    val = _trim_site_address(m.group(1))
+                    if val:
+                        out["address"] = (val, "elec_cert", i + 1)
+            if "sbl" not in out:
+                v = find_sbl(text)
+                if v:
+                    out["sbl"] = (v, "elec_cert", i + 1)
+            if "permit_hint" not in out:
+                v = find_permit_number(text)
+                if v:
+                    out["permit_hint"] = (v, i + 1)
+        elif "address" not in out:
+            m = _PLAN_REVIEW_ADDR_RE.search(text)
+            if m:
+                val = _trim_site_address(m.group(1))
+                if val:
+                    out["address"] = (val, "plan_review", i + 1)
+        if "address" in out and "sbl" in out and "permit_hint" in out:
+            break
+    return out
 
 
 def _claude_page_png(page, zoom):
@@ -1357,15 +1431,24 @@ class App(tk.Tk):
                 if ptype == "application" and application_idx is None:
                     application_idx = i
 
+        file_kind = None
         if official_idx is not None:
             target, permit_type = official_idx, "official"
-        elif application_idx is not None:
+        elif application_idx is not None and orange_idx is None:
             # Application forms are staged for filing but not used as a data source
             self.after(0, self._log, "[--] Application form detected — staged for filing, not used as data source")
             self.file_class[path] = "application"
             self._archive_scan_text(doc, path, "", "application")
             doc.close()
             return "", "", "", "", {"permit": "", "address": "", "sbl": "", "form_type": "application", "form_page": application_idx + 1}
+        elif application_idx is not None:
+            # Application form AND orange folder cover in the same file (typical
+            # merged batch): the application is still no data source, but the
+            # cover is — extract from it so the permit ID isn't silently lost.
+            self.after(0, self._log,
+                       f"[..] Application form + orange folder cover in one file — extracting from the cover (page {orange_idx + 1})")
+            target, permit_type = orange_idx, "unknown"
+            file_kind = "application"   # keep filing/merge behavior of an application file
         else:
             # No recognizable form anywhere: extract from the orange folder
             # cover if the quick sweep spotted one, else page 1
@@ -1373,7 +1456,7 @@ class App(tk.Tk):
             permit_type = "unknown"
 
         self.after(0, self._log, f"[..] Form type: {permit_type} (page {target + 1})")
-        self.file_class[path] = permit_type
+        self.file_class[path] = file_kind or permit_type
 
         # Push a quick 1.5× render of the target page to the preview panel
         try:
@@ -1455,6 +1538,31 @@ class App(tk.Tk):
                         sources["sbl"] = "claude"
                 except Exception as e:
                     self.after(0, self._log, f"[!]  Claude error: {e}")
+
+        # Fallback tier: electrical certs / plan-review pages elsewhere in this
+        # file. Lowest rank, fill-only — nothing here can displace a value found
+        # above, and reconcile_with_parcels gatekeeps whatever they contribute.
+        if not (permit and address and sbl):
+            try:
+                fb = _sweep_fallback_pages(doc, target)
+                if not address and "address" in fb:
+                    val, src, pg = fb["address"]
+                    address = val
+                    sources["address"] = src
+                    _lbl = "electrical cert" if src == "elec_cert" else "plan-review list"
+                    self.after(0, self._log, f"[..] Fallback: address '{val}' from {_lbl} (page {pg}) — verify")
+                if not sbl and "sbl" in fb:
+                    val, src, pg = fb["sbl"]
+                    sbl = val
+                    sources["sbl"] = src
+                    self.after(0, self._log, f"[..] Fallback: SBL '{val}' from electrical cert (page {pg}) — verify")
+                if not permit and "permit_hint" in fb:
+                    val, pg = fb["permit_hint"]
+                    self.after(0, self._log,
+                               f"[??] Electrical cert (page {pg}) shows permit '{val}' — SUGGESTION ONLY, "
+                               "cert numbers can be one digit off; verify against the documents before entering")
+            except Exception as e:
+                self.after(0, self._log, f"[!]  Fallback sweep error: {e}")
 
         doc.close()
         num, street = split_address(address) if address else ("", "")
@@ -2315,9 +2423,12 @@ class App(tk.Tk):
             buckets[ft].append(path)
             self.after(0, self._log, f"[..] {os.path.basename(path)} → {_TIER_LABEL[ft]}")
 
-        # Application forms are staged for filing but not used as a data source
+        # Application forms are staged for filing but not used as a data source.
+        # They still run as the LAST tier: a merged file classified "application"
+        # can carry an orange folder cover inside, and _extract_fields will pull
+        # data from that cover if fields are still missing.
         for path in buckets["application"]:
-            self.after(0, self._log, f"[--] {os.path.basename(path)} — application form, skipped as data source")
+            self.after(0, self._log, f"[--] {os.path.basename(path)} — application form, last-resort tier only")
 
         # ── Phase 2: Extract in tier order — official first, orange folder fills gaps ──
         best_permit = "";  best_permit_rank = 0
@@ -2326,7 +2437,7 @@ class App(tk.Tk):
         best_form_type = "";  best_form_page = 0
         best_sources = {"permit": "", "address": "", "sbl": ""}
 
-        for tier in ("official", "unknown"):
+        for tier in ("official", "unknown", "application"):
             if not buckets[tier]:
                 continue
 
@@ -2381,6 +2492,17 @@ class App(tk.Tk):
                         self.after(0, self._log, f"[--] Nothing new from {os.path.basename(path)}")
                 except Exception as e:
                     self.after(0, self._log, f"[!]  Error on {os.path.basename(path)}: {e}")
+
+        # Never end quietly without a permit ID — say so, and say why Claude
+        # couldn't be used if that was the reason.
+        if not best_permit:
+            if not load_claude_key():
+                self.after(0, self._log,
+                           "[!]  PERMIT ID NOT FOUND — no API key set, so orange covers were "
+                           "never sent to Claude. Set one via the API Key button and Re-OCR.")
+            else:
+                self.after(0, self._log,
+                           "[!]  PERMIT ID NOT FOUND after all tiers — check the pages and enter it manually before confirming")
 
         best_sources["form_type"] = best_form_type
         best_sources["form_page"] = best_form_page
