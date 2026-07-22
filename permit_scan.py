@@ -98,8 +98,12 @@ _INSPECTION_SHEET_RE = re.compile(r'INSPECTION\s+PROCEDURE', re.IGNORECASE)
 def detect_permit_type(text):
     upper = text.upper()
     # Application check FIRST — application forms contain "BUILDING PERMIT" + Yorktown markers
-    # which would otherwise match the official check below.
-    if re.search(r'APPLICATION\s+FOR\s+(?:A\s+)?BUILDING\s+PERMIT', upper):
+    # which would otherwise match the official check below. Covers all permit types:
+    # "Application for a Demolition Permit" was slipping through as "official",
+    # which let Tesseract's read of its handwritten fields outrank Claude's.
+    if re.search(r'APPLICATION\s+FOR\s+(?:A\s+)?'
+                 r'(?:BUILDING|DEMOLITION|ELECTRICAL|PLUMBING|MECHANICAL|POOL|FENCE|SIGN|FIRE)'
+                 r'\s+PERMIT', upper):
         return "application"
     if _INSPECTION_SHEET_RE.search(upper):
         return "unknown"
@@ -734,10 +738,38 @@ def reconcile_with_parcels(num, street, sbl, sources, log):
             sbl = addr_hit[0]
             sources["sbl"] = "parcel"
         else:
-            say(f"[!]  SBL '{sbl}' not found in county parcel data — verify")
+            # Handwriting often loses the LEADING digit ('6.11-3-3' for
+            # '16.11-3-3') — a unique suffix match in county data recovers it.
+            tail = re.sub(r'\s+', '', sbl)
+            near = _parcel_query(
+                "SELECT print_key, addr FROM parcels WHERE print_key LIKE ?",
+                ('%' + tail,)) if tail else []
+            if len(near) == 1:
+                say(f"[..] SBL repaired from county data: '{sbl}' → '{near[0][0]}' "
+                    f"(leading digit lost in scan) — verify")
+                sbl = near[0][0]
+                sources["sbl"] = "parcel"
+                sbl_hit = (near[0][0], near[0][1])
+            elif 1 < len(near) <= 4:
+                opts = "; ".join(f"{k} ({a})" for k, a in near)
+                say(f"[!]  SBL '{sbl}' not in county data — near matches: {opts} — verify")
+            else:
+                say(f"[!]  SBL '{sbl}' not found in county parcel data — verify")
     elif sbl and sbl_hit and addr_hit and sbl_hit[0] != addr_hit[0]:
         say(f"[!]  SBL/address conflict: form says {sbl_hit[0]}, county lists "
             f"{num} {street} as {addr_hit[0]} — verify before filing")
+
+    # A street name that isn't any real Yorktown street can't be right — if the
+    # (validated) SBL knows the parcel's address, county wins over the garble.
+    if sbl_hit and sbl_hit[1] and street and not addr_hit \
+            and fuzzy_match_street(street) == street and street.upper() not in KNOWN_STREETS:
+        m = re.match(r'^(\d+)\s+(.+)$', sbl_hit[1])
+        if m:
+            say(f"[..] Address replaced from county data: '{street}' is not a Yorktown "
+                f"street — county lists {sbl_hit[0]} as {sbl_hit[1]} — verify")
+            num, street = m.group(1), m.group(2)
+            sources["address"] = "parcel"
+            addr_hit = (sbl_hit[0], m.group(2))
 
     if not sbl and addr_hit:
         sbl = addr_hit[0]
@@ -1484,12 +1516,11 @@ class App(tk.Tk):
         if official_idx is not None:
             target, permit_type = official_idx, "official"
         elif application_idx is not None and orange_idx is None:
-            # Application forms are staged for filing but not used as a data source
-            self.after(0, self._log, "[--] Application form detected — staged for filing, not used as data source")
-            self.file_class[path] = "application"
-            self._archive_scan_text(doc, path, "", "application")
-            doc.close()
-            return "", "", "", "", {"permit": "", "address": "", "sbl": "", "form_type": "application", "form_page": application_idx + 1}
+            # Last-resort data source: the application form itself. Handwritten-
+            # heavy, so its Tesseract text ranks lowest (tesseract_hw) and Claude
+            # Sonnet does the real reading; county reconcile + history gatekeep.
+            self.after(0, self._log, "[..] Application form is the only data source — extracting (last resort)")
+            target, permit_type = application_idx, "application"
         elif application_idx is not None:
             # Application form AND orange folder cover in the same file (typical
             # merged batch): the application is still no data source, but the
@@ -1550,8 +1581,9 @@ class App(tk.Tk):
         if address: sources["address"] = text_source
         if sbl:     sources["sbl"]     = text_source
 
-        # Claude fills missing fields; for the orange folder (unknown) it also overrides tesseract_hw
-        handwritten = permit_type == "unknown"
+        # Claude fills missing fields; for handwritten-heavy forms (orange folder,
+        # application) it also overrides tesseract_hw
+        handwritten = permit_type in ("unknown", "application")
         if not (permit and address and sbl) or handwritten:
             api_key = load_claude_key()
             if api_key:
