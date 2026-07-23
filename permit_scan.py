@@ -866,15 +866,26 @@ def extract_fields_with_claude(page_png_bytes, api_key, app_no="", model="claude
     )
     response = client.messages.create(
         model=model,
-        max_tokens=150,
-        messages=[{"role": "user", "content": [
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
-            {"type": "text", "text": prompt},
-        ]}],
+        max_tokens=300,
+        messages=[
+            {"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
+                {"type": "text", "text": prompt},
+            ]},
+            # Prefill: the reply must continue this "{" — on pages that don't
+            # look like the forms described above, the model otherwise narrates
+            # in prose instead of returning JSON
+            {"role": "assistant", "content": "{"},
+        ],
     )
-    raw = response.content[0].text.strip()
-    raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw, flags=re.MULTILINE).strip()
-    data = json.loads(raw)
+    raw = "{" + (response.content[0].text.strip() if response.content else "")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        m = re.search(r'\{[^{}]*\}', raw)   # first balanced object; fields are flat
+        if not m:
+            raise
+        data = json.loads(m.group(0))
     permit_id = str(data.get("permit_id", "")).strip()
     address   = str(data.get("address",   "")).strip()
     section   = str(data.get("section",   "")).strip()
