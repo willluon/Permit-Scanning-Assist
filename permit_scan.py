@@ -101,9 +101,15 @@ def detect_permit_type(text):
     # which would otherwise match the official check below. Covers all permit types:
     # "Application for a Demolition Permit" was slipping through as "official",
     # which let Tesseract's read of its handwritten fields outrank Claude's.
-    if re.search(r'APPLICATION\s+FOR\s+(?:A\s+)?'
+    # \s* tolerates OCR-merged spacing: quick-pass Tesseract reads the stylized
+    # header as "APPLICATION FORA DEMOLITION PERMIT", which \s+ missed
+    if re.search(r'APPLICATION\s+FOR\s*A?\s*'
                  r'(?:BUILDING|DEMOLITION|ELECTRICAL|PLUMBING|MECHANICAL|POOL|FENCE|SIGN|FIRE)'
                  r'\s+PERMIT', upper):
+        return "application"
+    # Structural fallback when the header itself is unreadable: only application
+    # forms carry "(Office use only)" boxes next to an Application No. label
+    if re.search(r'OFFICE\s+USE\s+ONLY', upper) and re.search(r'APPLICATION\s+(?:NO|#|FEE)', upper):
         return "application"
     if _INSPECTION_SHEET_RE.search(upper):
         return "unknown"
@@ -576,6 +582,21 @@ def parcel_lookup_sbl(sbl):
     return None
 
 
+def _county_resolves(sbl):
+    """Does this as-read SBL resolve to a real county parcel, allowing the same
+    OCR damage reconcile can repair (dropped decimal/zero, lost leading digit)?
+    Returns (print_key, addr) or None."""
+    if not sbl or not parcel_db_available():
+        return None
+    hit = parcel_lookup_sbl(sbl)
+    if hit:
+        return hit
+    tail = re.sub(r'\s+', '', sbl)
+    near = _parcel_query("SELECT print_key, addr FROM parcels WHERE print_key LIKE ?",
+                         ('%' + tail,)) if tail else []
+    return near[0] if len(near) == 1 else None
+
+
 def parcel_lookup_address(num, street):
     """Find the parcel for a street number + name. Returns (print_key, street) or None.
 
@@ -744,12 +765,27 @@ def reconcile_with_parcels(num, street, sbl, sources, log):
             near = _parcel_query(
                 "SELECT print_key, addr FROM parcels WHERE print_key LIKE ?",
                 ('%' + tail,)) if tail else []
-            if len(near) == 1:
+            # A unique suffix match alone is a guess — a MISREAD SBL can suffix-
+            # match some unrelated parcel. Only repair when that parcel's county
+            # address agrees with the address read off the form; otherwise log
+            # the candidate as a suggestion and leave the field alone.
+            _corr = False
+            if len(near) == 1 and near[0][1]:
+                m = re.match(r'^(\d+)\s+(.+)$', near[0][1])
+                if m:
+                    _corr = (num and m.group(1) == str(num)) or \
+                            (street and (m.group(2) == _norm_street_key(street) or
+                                         fuzzy_match_street(street) == m.group(2)))
+            if len(near) == 1 and _corr:
                 say(f"[..] SBL repaired from county data: '{sbl}' → '{near[0][0]}' "
-                    f"(leading digit lost in scan) — verify")
+                    f"(leading digit lost in scan; address matches) — verify")
                 sbl = near[0][0]
                 sources["sbl"] = "parcel"
                 sbl_hit = (near[0][0], near[0][1])
+            elif len(near) == 1:
+                say(f"[!]  SBL '{sbl}' not in county data — closest parcel is "
+                    f"{near[0][0]} ({near[0][1] or 'no address'}), but nothing read off the "
+                    "form confirms it — verify")
             elif 1 < len(near) <= 4:
                 opts = "; ".join(f"{k} ({a})" for k, a in near)
                 say(f"[!]  SBL '{sbl}' not in county data — near matches: {opts} — verify")
@@ -864,25 +900,36 @@ def extract_fields_with_claude(page_png_bytes, api_key, app_no="", model="claude
         "Return ONLY a JSON object, nothing else. Use empty string for anything unclear.\n"
         'Example: {"permit_id":"20100240","address":"1005 East Main St","section":"16.10","block":"4","lot":"25"}'
     )
+    # Structured outputs force the reply to match this schema — on pages that
+    # don't look like the forms described above, the model otherwise narrates
+    # in prose instead of returning JSON. (Assistant prefill is not supported
+    # on Sonnet 4.6.)
+    schema = {
+        "type": "object",
+        "properties": {
+            "permit_id": {"type": "string"},
+            "address":   {"type": "string"},
+            "section":   {"type": "string"},
+            "block":     {"type": "string"},
+            "lot":       {"type": "string"},
+        },
+        "required": ["permit_id", "address", "section", "block", "lot"],
+        "additionalProperties": False,
+    }
     response = client.messages.create(
         model=model,
         max_tokens=300,
-        messages=[
-            {"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
-                {"type": "text", "text": prompt},
-            ]},
-            # Prefill: the reply must continue this "{" — on pages that don't
-            # look like the forms described above, the model otherwise narrates
-            # in prose instead of returning JSON
-            {"role": "assistant", "content": "{"},
-        ],
+        output_config={"format": {"type": "json_schema", "schema": schema}},
+        messages=[{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
+            {"type": "text", "text": prompt},
+        ]}],
     )
-    raw = "{" + (response.content[0].text.strip() if response.content else "")
+    raw = response.content[0].text.strip() if response.content else ""
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        m = re.search(r'\{[^{}]*\}', raw)   # first balanced object; fields are flat
+        m = re.search(r'\{[^{}]*\}', raw)   # last-resort: fish the object out of prose
         if not m:
             raise
         data = json.loads(m.group(0))
@@ -1474,6 +1521,7 @@ class App(tk.Tk):
         # Also remembers the first orange-folder page so an unknown batch
         # extracts from the cover sheet wherever it sits, not page 1.
         orange_idx = None
+        app_front = False
         if official_idx is None:
             self.after(0, self._log, "[..] No official permit in native text — quick-scanning pages...")
             _wlog = lambda m: self.after(0, self._log, m)
@@ -1498,8 +1546,15 @@ class App(tk.Tk):
                 if ptype == "official":
                     official_idx = i
                     break
-                if ptype == "application" and application_idx is None:
-                    application_idx = i
+                if ptype == "application":
+                    # Prefer the form FRONT (permit-no box / office-use markers)
+                    # over other application pages — e.g. the environmental-
+                    # review back side, which has no extractable fields
+                    is_front = bool(re.search(r'PERMIT\s*N[O0]|OFFICE\s+USE\s+ONLY',
+                                              text, re.IGNORECASE))
+                    if application_idx is None or (is_front and not app_front):
+                        application_idx = i
+                        app_front = is_front
                 if orange_idx is None and _ORANGE_LABEL_RE.search(text):
                     orange_idx = i
 
@@ -1625,6 +1680,17 @@ class App(tk.Tk):
                         address = cl_address
                         sources["address"] = "claude"
                     sbl_slot_open = not sbl or (handwritten and sources["sbl"] == "tesseract_hw")
+                    # A held OCR read that resolves to NO county parcel must not
+                    # block a Claude read that does — validation beats source
+                    # rank. (Native text is exempt: a printed SBL missing from
+                    # the roll can be a legitimately renumbered old parcel.)
+                    if not sbl_slot_open and cl_sbl and cl_sbl != sbl \
+                            and sources["sbl"] in ("tesseract", "tesseract_hw") \
+                            and _county_resolves(sbl) is None and _county_resolves(cl_sbl):
+                        self.after(0, self._log,
+                                   f"[..] OCR SBL '{sbl}' matches no county parcel; Claude's "
+                                   f"'{cl_sbl}' does — using Claude's")
+                        sbl_slot_open = True
                     if sbl_slot_open and cl_sbl:
                         sbl = cl_sbl
                         sources["sbl"] = "claude"
@@ -1679,6 +1745,11 @@ class App(tk.Tk):
                     opts = "; ".join(f"{a or '?'} ({s})" for a, s, _w, _f in hist[:4])
                     self.after(0, self._log,
                                f"[!]  History: permit {permit} maps to multiple parcels — not auto-filling: {opts}")
+                else:
+                    self.after(0, self._log,
+                               f"[i]  Permit {permit} has no prior confirmed filing in history — "
+                               "county data has no permit numbers, so the address/SBL can't be "
+                               "looked up from a permit ID alone")
             except Exception as e:
                 self.after(0, self._log, f"[!]  History lookup error: {e}")
 
@@ -1691,6 +1762,25 @@ class App(tk.Tk):
             street = corrected
         num, street, sbl, sources = reconcile_with_parcels(
             num, street, sbl, sources, lambda m: self.after(0, self._log, m))
+
+        # Last gate: never leave a value on the form we can PROVE is wrong.
+        # Machine reads only — printed (native) values stay, since historical
+        # permits legitimately carry renumbered parcels / renamed streets.
+        _machine = ("tesseract", "tesseract_hw", "claude", "elec_cert", "plan_review")
+        if street and sources.get("address") in _machine \
+                and street.upper() not in KNOWN_STREETS \
+                and fuzzy_match_street(street) == street:
+            self.after(0, self._log,
+                       f"[!]  Dropped street '{street}' — not a Yorktown street, no county "
+                       "repair found; left blank (check the form or Property lookup)")
+            street = ""
+            sources["address"] = ""
+        if sbl and sources.get("sbl") in _machine and _county_resolves(sbl) is None:
+            self.after(0, self._log,
+                       f"[!]  Dropped SBL '{sbl}' — matches no county parcel, no repair "
+                       "found; left blank (check the form or Property lookup)")
+            sbl = ""
+            sources["sbl"] = ""
         return permit, num, street, sbl, sources
 
     def _ocr_and_fill(self, path):
