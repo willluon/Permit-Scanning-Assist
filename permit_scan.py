@@ -821,6 +821,7 @@ def reconcile_with_parcels(num, street, sbl, sources, log):
 
     # Make a clean verification visible — silent success looks like nothing ran
     if sbl and addr_hit and sbl == addr_hit[0]:
+        sources["verified"] = True
         say(f"[OK] Verified against county parcels: {num} {street} = {sbl}")
 
     # Cover the formerly-silent paths: reconcile always reports its outcome
@@ -865,6 +866,12 @@ def save_claude_key(key):
 
 def extract_fields_with_claude(page_png_bytes, api_key, app_no="", model="claude-haiku-4-5-20251001"):
     import anthropic, base64
+    # Same page image + model + context always yields the same answer — serve
+    # repeats from the cache instead of paying the API again
+    cache_key = _claude_cache_key(page_png_bytes, model, app_no)
+    cached = _claude_cache_get(cache_key)
+    if cached is not None:
+        return cached
     client = anthropic.Anthropic(api_key=api_key)
     img_b64 = base64.standard_b64encode(page_png_bytes).decode()
     app_no_hint = (
@@ -939,6 +946,7 @@ def extract_fields_with_claude(page_png_bytes, api_key, app_no="", model="claude
     block     = str(data.get("block",     "")).strip()
     lot       = str(data.get("lot",       "")).strip()
     sbl = f"{section}-{block}-{lot}" if (section and block and lot) else ""
+    _claude_cache_put(cache_key, permit_id, address, sbl, model)
     return permit_id, address, sbl
 
 
@@ -1012,7 +1020,47 @@ def _archive_con():
             END;""")
     except sqlite3.OperationalError:
         pass  # FTS5 unavailable — archive_search falls back to LIKE
+    # Claude answers are deterministic per page image — cache them so repeat
+    # runs (watcher + Re-OCR + rescans of the same sheet) never pay twice
+    con.execute("""CREATE TABLE IF NOT EXISTS claude_cache (
+        key        TEXT PRIMARY KEY,
+        permit_id  TEXT DEFAULT '',
+        address    TEXT DEFAULT '',
+        sbl        TEXT DEFAULT '',
+        model      TEXT DEFAULT '',
+        created_at TEXT)""")
     return con
+
+
+def _claude_cache_key(page_png_bytes, model, app_no):
+    import hashlib
+    h = hashlib.sha256(page_png_bytes)
+    h.update(f"|{model}|{app_no}".encode())
+    return h.hexdigest()
+
+
+def _claude_cache_get(key):
+    con = _archive_con()
+    try:
+        row = con.execute("SELECT permit_id, address, sbl FROM claude_cache WHERE key=?",
+                          (key,)).fetchone()
+        return tuple(row) if row else None
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        con.close()
+
+
+def _claude_cache_put(key, permit_id, address, sbl, model):
+    con = _archive_con()
+    try:
+        con.execute("INSERT OR REPLACE INTO claude_cache VALUES (?,?,?,?,?,?)",
+                    (key, permit_id, address, sbl, model, _archive_now()))
+        con.commit()
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        con.close()
 
 
 def archive_record_scan(path, text, form_type):
@@ -1201,6 +1249,7 @@ class App(tk.Tk):
         # Each entry: {"current": path_in_staging, "renamed": False}
         self.staged = []
         self.file_class = {}   # path → classified form type, cached for merge ordering
+        self.batch_verified = False   # county-verified triple on the form — skip Claude for later files
         self._scanning = False
         self._src_labels = {}
         self._current_sources = {"permit": "", "address": "", "sbl": ""}
@@ -1650,7 +1699,12 @@ class App(tk.Tk):
         # Claude fills missing fields; for handwritten-heavy forms (orange folder,
         # application) it also overrides tesseract_hw
         handwritten = permit_type in ("unknown", "application")
-        if not (permit and address and sbl) or handwritten:
+        claude_needed = not (permit and address and sbl) or handwritten
+        if claude_needed and getattr(self, "batch_verified", False):
+            self.after(0, self._log,
+                       "[..] Skipping Claude — this batch already has a county-verified result")
+            claude_needed = False
+        if claude_needed:
             api_key = load_claude_key()
             if api_key:
                 try:
@@ -1852,6 +1906,13 @@ class App(tk.Tk):
             self._log(f"[OK] SBL: {sbl}  (click Copy when ready)")
         elif not self.sbl.get().strip():
             self._log("[!]  SBL not found — enter manually")
+
+        # A complete county-verified triple ends the batch's need for Claude —
+        # files that arrive after this point extract with Tesseract only
+        if sources.get("verified") and permit and \
+                self.permit_id.get().strip() and self.street_name.get().strip() \
+                and self.sbl.get().strip():
+            self.batch_verified = True
 
         self.confirm_btn.config(state="normal")
 
@@ -2063,6 +2124,7 @@ class App(tk.Tk):
 
         self.staged.clear()
         self.file_class.clear()
+        self.batch_verified = False
         self._clear_preview()
         self.permit_id.set("")
         self.street_num.set("")
