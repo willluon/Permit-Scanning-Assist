@@ -7,8 +7,13 @@ permit_scan_config.json
 # Scan history — personal data
 permit_scan_history.json
 
-# Debug log
-permit_scan_debug.log
+# Debug log (and its rotated generation)
+permit_scan_debug.log*
+
+# Databases — parcel/archive/census data includes resident addresses and owners
+*.db
+*.db-wal
+*.db-shm
 
 # Python
 __pycache__/

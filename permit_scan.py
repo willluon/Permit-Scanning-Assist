@@ -18,6 +18,7 @@ STAGING_FOLDER = os.path.join(_HOME, "Documents", "Permit Staging")
 HISTORY_FILE   = os.path.join(_HOME, "permit_scan_history.json")
 CONFIG_FILE    = os.path.join(_HOME, "permit_scan_config.json")
 DEBUG_LOG      = os.path.join(_HOME, "permit_scan_debug.log")
+DEBUG_LOG_MAX  = 2_000_000   # bytes — every log line is appended forever otherwise
 SKIP_EXTENSIONS   = {".tmp", ".part", ".crdownload", ""}
 TESSERACT_PATH    = os.path.join(_HOME, "AppData", "Local", "Programs", "Tesseract-OCR", "tesseract.exe")
 STREET_LIST_FILE  = os.path.join(_HOME, "yorktown_streets.txt")
@@ -52,7 +53,16 @@ KNOWN_STREETS = _load_known_streets()
 
 
 def fuzzy_match_street(street_name):
-    """Snap an OCR/AI street name to the closest known Yorktown street (cutoff 0.8)."""
+    """Snap an OCR/AI street name to the closest known Yorktown street.
+
+    Cutoff 0.9, not 0.8 — measured against the real street list, 0.8 makes
+    confident WRONG corrections: 'HEYWOOD ST' → 'WOOD ST' and 'HICKORY LN' →
+    'HICKORY ST'. Spelled-out suffixes ('SABER COURT') are already handled by
+    normalize_suffix before they reach here, so the tighter cutoff costs nothing.
+    NOTE: the blank-gate at the end of _extract_fields drops any machine-read
+    street this function can't place — raising the cutoff makes that gate fire
+    more often (blank rather than wrong, which is the intended trade).
+    """
     import difflib
     if not KNOWN_STREETS or not street_name:
         return street_name
@@ -186,6 +196,12 @@ def quick_ocr_page_type(doc, page_idx):
 _IMAGE_EXTS  = ('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp')
 _STAGE_EXTS  = ('.pdf',) + _IMAGE_EXTS
 _MERGE_ORDER = {"official": 0, "other": 1, "plans": 2, "orange": 3}
+# Name a file gets at Confirm & Rename: "{8 digits}{optional suffix} OPEN|CLOSED.pdf",
+# plus the " - 2" form used when an earlier filing of the same permit is still in
+# staging. Raw scanner output ("20260722153247958.pdf") never matches. Used to tell
+# already-confirmed files apart from a new batch after an app restart.
+_FINAL_NAME_RE = re.compile(r'^\d{8}[A-Za-z]*\s+(?:OPEN|CLOSED)(?:\s+-\s+\d+)?\.pdf$',
+                            re.IGNORECASE)
 _LEGAL_AREA  = 612 * 1008   # 8.5×14 in PDF points — anything well past this is plan-sized
 # Orange folder cover labels (preprinted, so Tesseract reads them reliably)
 _ORANGE_LABEL_RE  = re.compile(r'BLDG\.?\s*PER|LOCATION\s+OF\s+PROJECT', re.IGNORECASE)
@@ -1206,6 +1222,16 @@ def archive_backfill_from_history():
         con.close()
 
 
+def rotate_debug_log():
+    """Cap the debug log at one rollover generation. Called once at startup —
+    every _log line appends to this file, so over months it grows unbounded."""
+    try:
+        if os.path.exists(DEBUG_LOG) and os.path.getsize(DEBUG_LOG) > DEBUG_LOG_MAX:
+            os.replace(DEBUG_LOG, DEBUG_LOG + ".1")
+    except Exception:
+        pass
+
+
 # ── File watcher ───────────────────────────────────────────────────────────────
 
 class ScanHandler(FileSystemEventHandler):
@@ -1258,6 +1284,7 @@ class App(tk.Tk):
         self.folder_active = {folder: tk.BooleanVar(value=True) for folder in SCAN_FOLDERS}
 
         os.makedirs(STAGING_FOLDER, exist_ok=True)
+        rotate_debug_log()
 
         self._build_ui()
         self._start_watchers()
@@ -1492,6 +1519,11 @@ class App(tk.Tk):
     def _handle_file(self, path):
         ext = os.path.splitext(path)[1].lower()
         if ext in SKIP_EXTENSIONS:
+            return   # half-written scanner/download temp file
+        # Only scanner output is ours. Anything else saved into a watched folder
+        # used to be copied to staging and handed to fitz, which just errored.
+        if ext not in _STAGE_EXTS:
+            self._log(f"[--] Ignored {os.path.basename(path)} — not a scan file")
             return
 
         origin_folder = os.path.dirname(path)
@@ -1542,7 +1574,8 @@ class App(tk.Tk):
             self.after(0, self._log, f"[!]  Archive write failed: {e}")
 
     def _extract_fields(self, path):
-        """Run full extraction on a PDF. Returns (permit, num, street, sbl). Safe to call from any thread."""
+        """Run full extraction on a PDF. Returns (permit, num, street, sbl, sources).
+        Safe to call from any thread — all UI updates go through self.after."""
         import fitz
         doc = fitz.open(path)
         total_pages = len(doc)
@@ -1928,6 +1961,16 @@ class App(tk.Tk):
             self._log("[!]  Enter a Permit ID before confirming")
             return
 
+        # Establish there is actually something to file BEFORE prompting about
+        # duplicates — the dialog used to appear even on a no-op confirm.
+        unrenamed = [e for e in self.staged if not e["renamed"]]
+        if not unrenamed:
+            self._log("[!]  Nothing in staging to confirm")
+            return
+        if self._scanning:
+            self._log("[--] Scan in progress — wait for it to finish before confirming")
+            return
+
         # Duplicate detection — archive first (filenames/dates/status), JSON
         # history as fallback. A hit is often legitimate: permits get rescanned
         # as REVISED versions when info changes — so ask, never block.
@@ -1954,16 +1997,15 @@ class App(tk.Tk):
                         f"Address on file: {last.get('address', '—')}\n\nFile it again?"):
                     return
 
-        unrenamed = [e for e in self.staged if not e["renamed"]]
-        if not unrenamed:
-            self._log("[!]  Nothing in staging to confirm")
-            return
-        if self._scanning:
-            self._log("[--] Scan in progress — wait for it to finish before confirming")
-            return
-
-        new_name = f"{permit} {status}.pdf"
-        new_path = os.path.join(STAGING_FOLDER, new_name)
+        new_path = os.path.join(STAGING_FOLDER, f"{permit} {status}.pdf")
+        # An earlier filing of this permit may still be sitting in staging waiting
+        # to be dragged into Laserfiche — the merge path would have silently
+        # replaced it (os.replace) and the single-file path would have failed.
+        new_path = self._free_final_path(new_path, unrenamed)
+        new_name = os.path.basename(new_path)
+        if new_name != f"{permit} {status}.pdf":
+            self._log(f"[--] {permit} {status}.pdf is still in staging — "
+                      f"filing this batch as {new_name} so nothing is overwritten")
         self.confirm_btn.config(state="disabled")
         lf_path = self._laserfiche_path()
 
@@ -1991,6 +2033,25 @@ class App(tk.Tk):
         threading.Thread(target=self._merge_and_finalize,
                          args=(unrenamed, new_path, permit, address, sbl, status, lf_path),
                          daemon=True).start()
+
+    def _free_final_path(self, new_path, entries):
+        """A final name that won't clobber a confirmed file still in staging.
+
+        Overwriting the target is CORRECT when the target is one of our own
+        inputs — a re-merge legitimately includes the previously merged file.
+        Any other collision is a real earlier filing (typically a REVISED
+        rescan of the same permit) and gets the next free ' - 2' name.
+        """
+        def _key(p):
+            return os.path.normcase(os.path.abspath(p))
+        inputs = {_key(e["current"]) for e in entries}
+        if not os.path.exists(new_path) or _key(new_path) in inputs:
+            return new_path
+        base, ext = os.path.splitext(new_path)
+        n = 2
+        while os.path.exists(f"{base} - {n}{ext}"):
+            n += 1
+        return f"{base} - {n}{ext}"
 
     def _merge_category(self, path):
         """Bucket a staged file for merge ordering. Image files come from the
@@ -2596,28 +2657,50 @@ class App(tk.Tk):
             return
         files = [os.path.join(STAGING_FOLDER, f) for f in os.listdir(STAGING_FOLDER)
                  if f.lower().endswith(_STAGE_EXTS)]
+        pending = 0
         for p in files:
-            if not any(e["current"] == p for e in self.staged):
-                self.staged.append({"current": p, "renamed": False})
-                self._log(f"[..] Recovered: {os.path.basename(p)}")
-        if files:
+            if any(e["current"] == p for e in self.staged):
+                continue
+            name = os.path.basename(p)
+            # A file already named "{permit} OPEN/CLOSED.pdf" was confirmed in an
+            # earlier session and is only waiting to be dragged into Laserfiche.
+            # Recovering it as unrenamed would fold last batch's filed PDF into
+            # the next Confirm & Rename.
+            done = bool(_FINAL_NAME_RE.match(name))
+            self.staged.append({"current": p, "renamed": done})
+            if done:
+                self._log(f"[--] {name} — already confirmed, waiting to be filed")
+            else:
+                self._log(f"[..] Recovered: {name}")
+                pending += 1
+        if pending:
             self.confirm_btn.config(state="normal")
-            self._log(f"[--] {len(files)} file(s) found in staging from previous session")
+            self._log(f"[--] {pending} unfiled file(s) found in staging from previous session")
 
     def _reocr_staging(self):
         if self._scanning:
             self._log("[--] Scan already in progress — please wait")
             return
-        pdfs = sorted(
+        all_pdfs = sorted(
             [os.path.join(STAGING_FOLDER, f) for f in os.listdir(STAGING_FOLDER)
              if f.lower().endswith(".pdf")],
             key=os.path.getctime  # oldest first — first file to arrive in staging is tried first
         )
         images = [os.path.join(STAGING_FOLDER, f) for f in os.listdir(STAGING_FOLDER)
                   if f.lower().endswith(_IMAGE_EXTS)]
-        if not pdfs and not images:
+        if not all_pdfs and not images:
             self._log("[!]  No files in staging folder")
             return
+        # A file already named "{permit} OPEN/CLOSED.pdf" belongs to a batch that
+        # was confirmed already. Re-OCRing it would let the previous permit win
+        # this batch's fields, so mark it done and leave it out of the scan set.
+        confirmed = [p for p in all_pdfs if _FINAL_NAME_RE.match(os.path.basename(p))]
+        pdfs = [p for p in all_pdfs if p not in confirmed]
+        for p in confirmed:
+            if not any(e["current"] == p for e in self.staged):
+                self.staged.append({"current": p, "renamed": True})
+            self._log(f"[--] Skipping {os.path.basename(p)} — already confirmed "
+                      "(New Permit clears staging)")
         # Register any untracked files (drag-dropped, not from watcher).
         # Images are staged for the merge but are never a data source.
         for p in pdfs + images:
@@ -2627,7 +2710,7 @@ class App(tk.Tk):
         if images:
             self.confirm_btn.config(state="normal")
         if not pdfs:
-            self._log("[--] Only image files staged — nothing to OCR")
+            self._log("[--] No unfiled PDFs staged — nothing to OCR")
             return
         self._scanning = True
         self._set_progress(0)
