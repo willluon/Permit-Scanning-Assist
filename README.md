@@ -155,7 +155,30 @@ Laserfiche is the Town's official records management system. Every building perm
 |------|---------|
 | `permit_scan.py` | Main application — GUI, OCR pipeline, extraction logic, lookups |
 | `build_parcel_db.py` | Downloads all Yorktown parcels (SBL, address, owner) from the NYS GIS tax parcel service into `~\yorktown_parcels.db`. Re-run yearly when new assessment rolls publish. |
+| `census_scans.py` | Classifies and labels every page of the historical scan folders into `~\permit_census.db` |
+| `census_report.py` | Document-type catalog report over the census database |
 | `yorktown_streets.txt` | Validated list of ~500 Yorktown street names used for fuzzy matching |
+| `tests/` | Regression tests — see below |
+
+### Tests
+
+```
+python -m unittest discover -s tests -v
+```
+
+No API calls, no OCR, no GUI — they run in well under a second and cover the
+pure logic: form classification, permit/SBL/address extraction, street
+normalization, Laserfiche path building, the county reconcile guardrails, source
+ranking, and the staging-filename rules.
+
+The reconcile tests are the important ones. They pin behavior that has already
+been wrong once in production — most notably that a misread SBL which uniquely
+suffix-matches some unrelated parcel must be **left alone** rather than
+"repaired" into a confidently wrong parcel. Tests marked
+`test_KNOWN_LIMITATION_*` record current behavior that is accepted but not
+desired; they are the ones to revisit, not to trust.
+
+Tests requiring `~\yorktown_parcels.db` skip themselves when it isn't present.
 
 ### Local Data Files (not in repo)
 
