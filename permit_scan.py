@@ -1444,15 +1444,34 @@ class App(tk.Tk):
         path = self._laserfiche_path()
         if not path:
             self.path_label.config(text="Fill in street info above", foreground="gray")
+        elif not self.street_num.get().strip():
+            # ~7% of Yorktown parcels have no street number, and Laserfiche names
+            # their leaf folders inconsistently: some kept the orphaned space from
+            # the "{number} {street}" template ("\ SAGAMORE AVE."), others didn't
+            # ("\DARBY ST."). Both confirmed by hand — there is no rule to infer,
+            # so flag it instead of guessing. Do NOT "fix" laserfiche_path_for
+            # to add or drop the space; that has been changed in both directions
+            # already (87eb301) and neither is right for every parcel.
+            self.path_label.config(
+                text=path + "\n[!] no street number — the folder may start with a "
+                            "space; check the name in Laserfiche",
+                foreground="#e65100")
         else:
             self.path_label.config(text=path, foreground="#0055cc")
 
     def _copy_path(self):
         path = self._laserfiche_path()
-        if path:
-            self.clipboard_clear()
-            self.clipboard_append(path)
+        if not path:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(path)
+        if self.street_num.get().strip():
             self._log("[OK] Path copied to clipboard")
+        else:
+            leaf = path.rsplit("\\", 1)[-1]
+            self._log(f"[!]  Path copied, but this parcel has no street number — the "
+                      f"folder is either '{leaf}' or ' {leaf}' (leading space). "
+                      "Both spellings exist in Laserfiche; check before pasting.")
 
     def _copy_sbl(self):
         sbl = self.sbl.get().strip()

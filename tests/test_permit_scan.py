@@ -272,8 +272,21 @@ class TestLaserfichePath(unittest.TestCase):
                          rf"{self.ROOT}\M\MOHANSIC AVE. EAST\7 MOHANSIC AVE. EAST")
 
     def test_no_street_number_uses_the_street_as_leaf(self):
+        # DO NOT "fix" this to emit a leading space. Laserfiche is inconsistent
+        # for numberless parcels — both spellings were confirmed by hand:
+        #     ...\D\DARBY ST.\DARBY ST.          (no space)
+        #     ...\S\SAGAMORE AVE.\ SAGAMORE AVE. (orphaned space from "{num} {st}")
+        # The line has already been changed in BOTH directions (87eb301 removed
+        # the space; permit 20160001 on 2026-07-27 showed it is sometimes needed).
+        # Neither form is right for every parcel, so the app emits the no-space
+        # form and _refresh_path/_copy_path warn that the folder may start with
+        # a space. ~7% of Yorktown parcels (1,005 of 14,407) have no number.
         self.assertEqual(ps.laserfiche_path_for("", "DARBY ST"),
                          rf"{self.ROOT}\D\DARBY ST.\DARBY ST.")
+
+    def test_no_street_number_on_a_route(self):
+        self.assertEqual(ps.laserfiche_path_for("", "ROUTE 6"),
+                         rf"{self.ROOT}\R\ROUTE 6\ROUTE 6")
 
     def test_empty_street_yields_no_path(self):
         self.assertEqual(ps.laserfiche_path_for("123", ""), "")
