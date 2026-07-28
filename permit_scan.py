@@ -433,7 +433,11 @@ def find_application_number(text):
     return m.group(1).strip() if m else ""
 
 
-_PERMIT_ID_SUFFIXES = re.compile(r'\s*(DEMO|RES|COM|ALT|ADD|NEW|POOL|ELEC|PLMB|MECH)\b', re.IGNORECASE)
+_PERMIT_ID_SUFFIXES = re.compile(r'\s*(DEMO|FD|RES|COM|ALT|ADD|NEW|POOL|ELEC|PLMB|MECH)\b', re.IGNORECASE)
+# Suffix glued directly to the digits ("20160001FD") is part of the permit ID even
+# when it's not a known type — but only if ALL CAPS, so a following word with a
+# dropped space ("20160001File") can't be swallowed.
+_PERMIT_ID_GLUED_SUFFIX = re.compile(r'([A-Z]{1,6})(?![a-zA-Z])')
 
 def find_permit_number(text, blocked_digits=None):
     """Return permit ID (8 digits + optional suffix like DEMO), skipping candidates matching blocked_digits."""
@@ -453,9 +457,17 @@ def find_permit_number(text, blocked_digits=None):
             if len(digits) == 8:
                 if blocked_digits and digits == blocked_digits:
                     continue
-                # Check for a known permit-type suffix immediately after the matched digits
-                sm = _PERMIT_ID_SUFFIXES.match(text[m.end():m.end() + 8])
+                # Check for a permit-type suffix immediately after the matched digits.
+                # Known suffixes may be spaced ("20100027 DEMO"); unknown ones count
+                # only when glued to the digits ("20160001FD") — a spaced word there
+                # is just the next label ("20160001 File Date").
+                tail = text[m.end():m.end() + 8]
+                sm = _PERMIT_ID_SUFFIXES.match(tail)
                 suffix = sm.group(1).upper() if sm else ""
+                if not suffix:
+                    gm = _PERMIT_ID_GLUED_SUFFIX.match(tail)
+                    if gm:
+                        suffix = gm.group(1)
                 return digits + suffix
     return ""
 
@@ -1777,6 +1789,15 @@ class App(tk.Tk):
                         else:
                             permit = cl_permit
                             sources["permit"] = "claude"
+                    elif (permit and re.fullmatch(r'\d{8}', permit) and '-' not in cl_permit
+                          and len(cl_permit_digits) == 8
+                          and cl_permit.upper().startswith(permit) and len(cl_permit) > 8):
+                        # Same 8 digits, but Claude sees a type suffix (FD, DEMO, ...)
+                        # the text read missed — suffixes distinguish real permits
+                        # (20160001 vs 20160001FD are different jobs)
+                        self.after(0, self._log,
+                                   f"[..] Claude read a suffix on the permit: {permit} → {cl_permit.upper()}")
+                        permit = cl_permit.upper()
                     addr_slot_open = not address or (handwritten and sources["address"] == "tesseract_hw")
                     if addr_slot_open and cl_address:
                         cl_address = re.sub(r',?\s*(Yorktown|New York|NY|\d{5}).*$', '', cl_address, flags=re.IGNORECASE).strip()
@@ -2007,7 +2028,9 @@ class App(tk.Tk):
                     "(Yes is correct if this is a REVISED version or additional pages.)"):
                 return
         else:
-            prior = [e for e in load_history() if e.get("permit_id", "").startswith(permit[:8])]
+            # Exact match only — 20160001, 20160001FD and 20160001DEMO share the
+            # first 8 digits but are different permits on different properties
+            prior = [e for e in load_history() if e.get("permit_id", "") == permit]
             if prior:
                 last = prior[0]
                 if not messagebox.askyesno(

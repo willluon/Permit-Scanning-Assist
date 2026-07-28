@@ -75,6 +75,25 @@ class TestFindPermitNumber(unittest.TestCase):
     def test_type_suffix_is_kept(self):
         self.assertEqual(ps.find_permit_number("Permit No. 20100027DEMO"), "20100027DEMO")
 
+    def test_unknown_glued_suffix_is_kept(self):
+        # Real scan 2026-07-27: FD wasn't whitelisted, so 20160001FD was stored
+        # as 20160001 and collided with the real permit 20160001 the next day
+        self.assertEqual(
+            ps.find_permit_number("Permit #: 20160001FD File Date: 2/26/2016"),
+            "20160001FD")
+
+    def test_spaced_following_word_is_not_a_suffix(self):
+        # "File" follows with a space — it's the next label, not part of the ID
+        self.assertEqual(
+            ps.find_permit_number("Permit #: 20160001 File Date: 1/4/2016"),
+            "20160001")
+
+    def test_glued_mixed_case_word_is_not_a_suffix(self):
+        # A dropped space before a normal word must not be swallowed
+        self.assertEqual(
+            ps.find_permit_number("Permit #: 20160001File Date: 1/4/2016"),
+            "20160001")
+
     def test_hyphenated_value_is_rejected(self):
         # Application numbers are hyphenated; permit numbers never are. The dash
         # check must run BEFORE digit-stripping or the guard is defeated.
