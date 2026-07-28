@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import os
 import sqlite3
 import threading
@@ -13,7 +13,9 @@ import shutil
 import subprocess
 
 _HOME          = os.path.expanduser("~")
-SCAN_FOLDERS   = [r"U:\Documents\Scans", r"F:\scan"]
+# Defaults for a fresh install — the user's actual list lives in CONFIG_FILE
+# ("scan_folders") and is editable from the Scan Watchers panel
+SCAN_FOLDERS   = [r"U:\Documents\wscans", r"F:\scan"]
 STAGING_FOLDER = os.path.join(_HOME, "Documents", "Permit Staging")
 HISTORY_FILE   = os.path.join(_HOME, "permit_scan_history.json")
 CONFIG_FILE    = os.path.join(_HOME, "permit_scan_config.json")
@@ -892,6 +894,29 @@ def save_claude_key(key):
     with open(CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
 
+def load_scan_folders():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE) as f:
+                folders = json.load(f).get("scan_folders")
+            if isinstance(folders, list) and folders:
+                return [os.path.normpath(fo) for fo in folders]
+        except Exception:
+            pass
+    return list(SCAN_FOLDERS)
+
+def save_scan_folders(folders):
+    cfg = {}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE) as f:
+                cfg = json.load(f)
+        except Exception:
+            pass
+    cfg["scan_folders"] = list(folders)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+
 def extract_fields_with_claude(page_png_bytes, api_key, app_no="", model="claude-haiku-4-5-20251001"):
     import anthropic, base64
     # Same page image + model + context always yields the same answer — serve
@@ -1292,8 +1317,10 @@ class App(tk.Tk):
         self._src_labels = {}
         self._current_sources = {"permit": "", "address": "", "sbl": ""}
 
-        # Per-folder active toggles
-        self.folder_active = {folder: tk.BooleanVar(value=True) for folder in SCAN_FOLDERS}
+        # Watched folders (from config) + per-folder active toggles; vars are
+        # created lazily in _folder_var so rebuilds don't stack duplicate traces
+        self.scan_folders = load_scan_folders()
+        self.folder_active = {}
 
         os.makedirs(STAGING_FOLDER, exist_ok=True)
         rotate_debug_log()
@@ -1367,22 +1394,14 @@ class App(tk.Tk):
 
         wf = ttk.LabelFrame(self, text="Scan Watchers", padding=8)
         wf.grid(row=2, column=0, **p, sticky="ew")
-        for i, folder in enumerate(SCAN_FOLDERS):
-            label = os.path.basename(folder) or folder
-            var   = self.folder_active[folder]
-            row_f = ttk.Frame(wf)
-            row_f.grid(row=i, column=0, sticky="ew", pady=2)
-            ttk.Label(row_f, text=folder, font=("Consolas", 8), foreground="gray").pack(side="left")
-            btn = tk.Button(row_f, textvariable=tk.StringVar(),
-                            width=6, relief="groove", cursor="hand2",
-                            command=lambda f=folder: self._toggle_watcher(f))
-            btn.pack(side="right", padx=(8, 0))
-            self.folder_active[folder].trace_add("write", lambda *_, f=folder: self._update_toggle_btn(f))
-            btn._folder = folder
-            if not hasattr(self, "_toggle_btns"):
-                self._toggle_btns = {}
-            self._toggle_btns[folder] = btn
-            self._update_toggle_btn(folder)
+        wf.columnconfigure(0, weight=1)
+        self._watch_rows = ttk.Frame(wf)
+        self._watch_rows.grid(row=0, column=0, sticky="ew")
+        self._watch_rows.columnconfigure(0, weight=1)
+        ttk.Button(wf, text="Add Folder…", command=self._add_watch_folder)\
+            .grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self._toggle_btns = {}
+        self._rebuild_watcher_rows()
 
         lf = ttk.LabelFrame(self, text="File Activity", padding=10)
         lf.grid(row=3, column=0, **p, sticky="ew")
@@ -1436,6 +1455,59 @@ class App(tk.Tk):
                   row=6, column=0, pady=(0, 6))
 
     # ── Path helpers ──────────────────────────────────────────────────────────
+
+    def _folder_var(self, folder):
+        var = self.folder_active.get(folder)
+        if var is None:
+            var = tk.BooleanVar(value=True)
+            self.folder_active[folder] = var
+            var.trace_add("write", lambda *_, f=folder: self._update_toggle_btn(f))
+        return var
+
+    def _rebuild_watcher_rows(self):
+        for w in self._watch_rows.winfo_children():
+            w.destroy()
+        self._toggle_btns = {}
+        for i, folder in enumerate(self.scan_folders):
+            self._folder_var(folder)
+            row_f = ttk.Frame(self._watch_rows)
+            row_f.grid(row=i, column=0, sticky="ew", pady=2)
+            ttk.Label(row_f, text=folder, font=("Consolas", 8), foreground="gray").pack(side="left")
+            btn = tk.Button(row_f, width=6, relief="groove", cursor="hand2",
+                            command=lambda f=folder: self._toggle_watcher(f))
+            btn.pack(side="right", padx=(8, 0))
+            tk.Button(row_f, text="✕", width=2, relief="flat", cursor="hand2", fg="#b71c1c",
+                      command=lambda f=folder: self._remove_watch_folder(f)).pack(side="right")
+            self._toggle_btns[folder] = btn
+            self._update_toggle_btn(folder)
+
+    def _add_watch_folder(self):
+        folder = filedialog.askdirectory(title="Choose a folder to watch for scans")
+        if not folder:
+            return
+        folder = os.path.normpath(folder)
+        if folder in self.scan_folders:
+            self._log(f"[--] Already watching {folder}")
+            return
+        self.scan_folders.append(folder)
+        save_scan_folders(self.scan_folders)
+        self._watch_folder(folder)
+        self._rebuild_watcher_rows()
+
+    def _remove_watch_folder(self, folder):
+        # Non-destructive: stops watching only — the folder and its files stay put
+        if folder in self.scan_folders:
+            self.scan_folders.remove(folder)
+        save_scan_folders(self.scan_folders)
+        w = self._watches.pop(folder, None)
+        if w:
+            try:
+                self.observer.unschedule(w)
+            except Exception:
+                pass
+        self.folder_active.pop(folder, None)
+        self._log(f"[--] Stopped watching {folder}")
+        self._rebuild_watcher_rows()
 
     def _toggle_watcher(self, folder):
         self.folder_active[folder].set(not self.folder_active[folder].get())
@@ -2955,16 +3027,20 @@ class App(tk.Tk):
     # ── Watchers ──────────────────────────────────────────────────────────────
 
     def _start_watchers(self):
-        handler = ScanHandler(self._on_file)
+        self._scan_handler = ScanHandler(self._on_file)
         self.observer = Observer()
-        for folder in SCAN_FOLDERS:
-            if os.path.exists(folder):
-                self.observer.schedule(handler, folder, recursive=False)
-                self._log(f"[--] Watching {folder}")
-            else:
-                self._log(f"[!]  Not found: {folder}")
+        self._watches = {}
+        for folder in self.scan_folders:
+            self._watch_folder(folder)
         self.observer.start()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _watch_folder(self, folder):
+        if os.path.exists(folder):
+            self._watches[folder] = self.observer.schedule(self._scan_handler, folder, recursive=False)
+            self._log(f"[--] Watching {folder}")
+        else:
+            self._log(f"[!]  Not found: {folder}")
 
     def _on_close(self):
         self.observer.stop()
