@@ -920,6 +920,31 @@ def save_scan_folders(folders):
     with open(CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
 
+_WINDOW_POS_RE = re.compile(r'^[+-]\d+[+-]\d+$')
+
+def load_window_pos():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE) as f:
+                pos = json.load(f).get("window_pos", "")
+            if _WINDOW_POS_RE.match(pos):
+                return pos
+        except Exception:
+            pass
+    return ""
+
+def save_window_pos(pos):
+    cfg = {}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE) as f:
+                cfg = json.load(f)
+        except Exception:
+            pass
+    cfg["window_pos"] = pos
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+
 def extract_fields_with_claude(page_png_bytes, api_key, app_no="", model="claude-haiku-4-5-20251001"):
     import anthropic, base64
     # Same page image + model + context always yields the same answer — serve
@@ -1331,6 +1356,7 @@ class App(tk.Tk):
         rotate_debug_log()
 
         self._build_ui()
+        self._restore_window_pos()
         self._start_watchers()
         self._recover_staging()
 
@@ -1434,7 +1460,9 @@ class App(tk.Tk):
                                        text="no\npreview", fg="#444444",
                                        font=("Consolas", 8))
         self._preview_label.place(relx=0.5, rely=0.5, anchor="center")
+        self._preview_label.bind("<Button-1>", self._open_preview_file)
         self._preview_photo = None
+        self._preview_path = None
 
         prog_row = ttk.Frame(lf)
         prog_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
@@ -1462,10 +1490,14 @@ class App(tk.Tk):
         ttk.Button(bf2, text="Show OCR",      command=self._show_ocr,      width=9).pack(side="left", padx=6)
         ttk.Button(bf2, text="API Key",       command=self._set_api_key,   width=8).pack(side="left", padx=6)
 
+        ttk.Label(self, text="Enter = Confirm   ·   N = New Permit   ·   R = Re-OCR   ·   click the preview to open the scan",
+                  font=("Segoe UI", 8), foreground="#aaaaaa").grid(
+                  row=7, column=0, pady=(0, 2))
+
         self._stats_var = tk.StringVar()
         ttk.Label(self, textvariable=self._stats_var,
                   font=("Segoe UI", 8), foreground="#888888").grid(
-                  row=7, column=0, pady=(0, 6))
+                  row=8, column=0, pady=(0, 6))
 
     # ── Path helpers ──────────────────────────────────────────────────────────
 
@@ -1667,7 +1699,7 @@ class App(tk.Tk):
             f"Today: {today_n} permit{'s' if today_n != 1 else ''}   ·   Past 7 days: {week_n}"
         )
 
-    def _update_preview(self, png_bytes):
+    def _update_preview(self, png_bytes, path=None):
         from PIL import Image, ImageTk
         import io
         try:
@@ -1675,13 +1707,33 @@ class App(tk.Tk):
             img.thumbnail((115, 155), Image.LANCZOS)
             photo = ImageTk.PhotoImage(img)
             self._preview_photo = photo  # hold reference so GC doesn't collect it
-            self._preview_label.config(image=photo, text="")
+            self._preview_label.config(image=photo, text="",
+                                       cursor="hand2" if path else "arrow")
+            self._preview_path = path
         except Exception:
             pass
 
     def _clear_preview(self):
         self._preview_photo = None
-        self._preview_label.config(image="", text="no\npreview")
+        self._preview_path = None
+        self._preview_label.config(image="", text="no\npreview", cursor="arrow")
+
+    def _open_preview_file(self, _event=None):
+        p = self._preview_path
+        if not p:
+            return
+        if not os.path.exists(p):
+            # Confirm & Rename moves the file out from under the thumbnail
+            batch = [e["current"] for e in self.staged if os.path.exists(e["current"])]
+            if len(batch) == 1:
+                p = batch[0]
+            else:
+                self._log(f"[--] {os.path.basename(p)} is no longer in staging")
+                return
+        try:
+            os.startfile(p)
+        except Exception as e:
+            self._log(f"[!]  Could not open {os.path.basename(p)}: {e}")
 
     # ── File handling ─────────────────────────────────────────────────────────
 
@@ -1863,7 +1915,7 @@ class App(tk.Tk):
         try:
             import fitz as _fitz
             _prev = doc[target].get_pixmap(matrix=_fitz.Matrix(1.5, 1.5))
-            self.after(0, self._update_preview, _prev.tobytes("png"))
+            self.after(0, self._update_preview, _prev.tobytes("png"), path)
             del _prev
         except Exception:
             pass
@@ -3152,7 +3204,23 @@ class App(tk.Tk):
         else:
             self._log(f"[!]  Not found: {folder}")
 
+    def _restore_window_pos(self):
+        pos = load_window_pos()
+        m = re.match(r'^([+-]\d+)([+-]\d+)$', pos) if pos else None
+        if not m:
+            return
+        x, y = int(m.group(1)), int(m.group(2))
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        # Generous bounds so a second monitor still counts, but a position from
+        # a since-unplugged screen can't strand the window out of reach
+        if -sw <= x <= sw * 2 and 0 <= y <= sh - 80:
+            self.geometry(f"{x:+d}{y:+d}")
+
     def _on_close(self):
+        try:
+            save_window_pos(f"{self.winfo_x():+d}{self.winfo_y():+d}")
+        except Exception:
+            pass
         self.observer.stop()
         self.observer.join()
         self.destroy()
