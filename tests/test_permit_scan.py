@@ -384,13 +384,21 @@ class TestFinalNameRecognition(unittest.TestCase):
     wrong folds the previous batch's filed PDF into the next one."""
 
     def test_confirmed_names_match(self):
+        # Bare-ID names are the current form (OPEN/CLOSED dropped 2026-07-29)
+        for name in ("20160009.pdf", "20160009DEMO.pdf", "20160009FD.pdf",
+                     "20160009 - 2.pdf"):
+            self.assertTrue(ps._FINAL_NAME_RE.match(name), name)
+
+    def test_legacy_open_closed_names_still_match(self):
+        # Filings from before 2026-07-29 sit in staging with the old names —
+        # forgetting them re-arms a filed PDF into the next batch
         for name in ("20160009 OPEN.pdf", "20160009 CLOSED.pdf",
                      "20160009DEMO OPEN.pdf", "20160009 OPEN - 2.pdf"):
             self.assertTrue(ps._FINAL_NAME_RE.match(name), name)
 
     def test_raw_scanner_output_does_not_match(self):
-        for name in ("20260722153247958.pdf", "20160009.pdf",
-                     "scan of 20160009 OPEN.pdf", "plans.tif"):
+        for name in ("20260722153247958.pdf", "scan of 20160009 OPEN.pdf",
+                     "Building_scans 1680.1.tif", "plans.tif"):
             self.assertFalse(ps._FINAL_NAME_RE.match(name), name)
 
 
@@ -400,7 +408,7 @@ class TestFreeFinalPath(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        self.target = os.path.join(self.tmp, "20160009 OPEN.pdf")
+        self.target = os.path.join(self.tmp, "20160009.pdf")
         self.other = os.path.join(self.tmp, "20260722153247958.pdf")
         open(self.other, "w").close()
         self.free = ps.App._free_final_path.__get__(object())  # uses no self state
@@ -415,7 +423,7 @@ class TestFreeFinalPath(unittest.TestCase):
         open(self.target, "w").close()
         self.assertEqual(
             os.path.basename(self.free(self.target, [{"current": self.other}])),
-            "20160009 OPEN - 2.pdf")
+            "20160009 - 2.pdf")
 
     def test_collision_with_our_own_input_may_be_overwritten(self):
         # A re-merge legitimately includes the previously merged file
@@ -426,10 +434,10 @@ class TestFreeFinalPath(unittest.TestCase):
 
     def test_counts_past_names_already_taken(self):
         open(self.target, "w").close()
-        open(os.path.join(self.tmp, "20160009 OPEN - 2.pdf"), "w").close()
+        open(os.path.join(self.tmp, "20160009 - 2.pdf"), "w").close()
         self.assertEqual(
             os.path.basename(self.free(self.target, [{"current": self.other}])),
-            "20160009 OPEN - 3.pdf")
+            "20160009 - 3.pdf")
 
 
 class TestStageableExtensions(unittest.TestCase):
@@ -445,9 +453,14 @@ class TestStageableExtensions(unittest.TestCase):
 # ── Source ranking ────────────────────────────────────────────────────────────
 
 class TestSourceRank(unittest.TestCase):
-    def test_county_outranks_everything(self):
+    def test_manual_outranks_everything(self):
+        # What the user typed can never be overwritten by a late OCR thread
         top = max(ps._SOURCE_RANK.values())
-        self.assertEqual(ps._SOURCE_RANK["parcel"], top)
+        self.assertEqual(ps._SOURCE_RANK["manual"], top)
+
+    def test_county_outranks_every_extractor(self):
+        top_extractor = max(v for k, v in ps._SOURCE_RANK.items() if k != "manual")
+        self.assertEqual(ps._SOURCE_RANK["parcel"], top_extractor)
 
     def test_claude_outranks_tesseract_on_handwriting(self):
         self.assertGreater(ps._SOURCE_RANK["claude"], ps._SOURCE_RANK["tesseract_hw"])

@@ -32,9 +32,10 @@ IGNORE_ADDRESSES = ["363 UNDERHILL AVE"]
 # parcel       = county GIS parcel data (yorktown_parcels.db) — authoritative, outranks everything
 # elec_cert / plan_review = fallback pages elsewhere in the batch — lowest rank,
 #                fill-only (can never displace another source), county reconcile gatekeeps
-_SOURCE_RANK = {"parcel": 5, "native": 4, "tesseract": 3, "claude": 2,
+_SOURCE_RANK = {"manual": 6, "parcel": 5, "native": 4, "tesseract": 3, "claude": 2,
                 "tesseract_hw": 1, "elec_cert": 1, "plan_review": 1, "history": 1, "": 0}
 _SRC_STYLE   = {
+    "manual":       ("manual",     "#37474f"),
     "parcel":       ("county",     "#00695c"),
     "native":       ("text",       "#2e7d32"),
     "tesseract":    ("ocr",        "#e65100"),
@@ -198,11 +199,13 @@ def quick_ocr_page_type(doc, page_idx):
 _IMAGE_EXTS  = ('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp')
 _STAGE_EXTS  = ('.pdf',) + _IMAGE_EXTS
 _MERGE_ORDER = {"official": 0, "other": 1, "plans": 2, "orange": 3}
-# Name a file gets at Confirm & Rename: "{8 digits}{optional suffix} OPEN|CLOSED.pdf",
-# plus the " - 2" form used when an earlier filing of the same permit is still in
-# staging. Raw scanner output ("20260722153247958.pdf") never matches. Used to tell
-# already-confirmed files apart from a new batch after an app restart.
-_FINAL_NAME_RE = re.compile(r'^\d{8}[A-Za-z]*\s+(?:OPEN|CLOSED)(?:\s+-\s+\d+)?\.pdf$',
+# Name a file gets at Confirm & Rename: "{8 digits}{optional suffix}.pdf" (the
+# " OPEN|CLOSED" middle is legacy — filings before 2026-07-29 carry it and must
+# still be recognized), plus the " - 2" form used when an earlier filing of the
+# same permit is still in staging. Raw scanner output ("20260722153247958.pdf")
+# never matches (digits past the first 8). Used to tell already-confirmed files
+# apart from a new batch after an app restart.
+_FINAL_NAME_RE = re.compile(r'^\d{8}[A-Za-z]*(?:\s+(?:OPEN|CLOSED))?(?:\s+-\s+\d+)?\.pdf$',
                             re.IGNORECASE)
 _LEGAL_AREA  = 612 * 1008   # 8.5×14 in PDF points — anything well past this is plan-sized
 # Orange folder cover labels (preprinted, so Tesseract reads them reliably)
@@ -1012,7 +1015,9 @@ def load_history():
     return []
 
 
-def append_history(permit_id, address, sbl, status="OPEN"):
+def append_history(permit_id, address, sbl, status=""):
+    # status is legacy (OPEN/CLOSED dropped from the workflow 2026-07-29) —
+    # the key stays so old rows and new rows share a shape
     history = load_history()
     history.insert(0, {
         "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -1306,8 +1311,8 @@ class App(tk.Tk):
         self.street_num  = tk.StringVar()
         self.street_name = tk.StringVar()
         self.sbl         = tk.StringVar()
-        self.status_var  = tk.StringVar(value="OPEN")
         self.last_ocr_text = ""
+        self._prog_set = False   # True while code (not the user) writes the field vars
 
         # Each entry: {"current": path_in_staging, "renamed": False}
         self.staged = []
@@ -1332,6 +1337,11 @@ class App(tk.Tk):
         for v in (self.permit_id, self.street_num, self.street_name):
             v.trace_add("write", lambda *_: self._refresh_path())
         self.sbl.trace_add("write", lambda *_: self._validate_sbl())
+        # A write that isn't guarded by _prog_set came from the user typing —
+        # relabel the field "manual" so a stale "ai ←verify" doesn't outlive the fix
+        for v, field in ((self.permit_id, "permit"), (self.street_num, "address"),
+                         (self.street_name, "address"), (self.sbl, "sbl")):
+            v.trace_add("write", lambda *_, f=field: self._field_edited(f))
         self.bind("<Key>", self._on_hotkey)
         self.after(100, self._update_stats)
         self.after(150, self._init_archive)
@@ -1377,11 +1387,6 @@ class App(tk.Tk):
         self._src_labels["sbl"] = tk.Label(info, text="", font=("Consolas", 8), width=12, anchor="w", relief="flat", bd=0)
         self._src_labels["sbl"].grid(row=3, column=2, sticky="w")
 
-        sf = ttk.Frame(info)
-        sf.grid(row=4, column=0, columnspan=3, pady=(10, 2))
-        ttk.Radiobutton(sf, text="OPEN",   variable=self.status_var, value="OPEN").pack(side="left", padx=20)
-        ttk.Radiobutton(sf, text="CLOSED", variable=self.status_var, value="CLOSED").pack(side="left", padx=20)
-
         self._form_lbl = ttk.Label(info, text="", font=("Segoe UI", 8))
         self._form_lbl.grid(row=5, column=0, columnspan=3, pady=(2, 0))
 
@@ -1403,8 +1408,16 @@ class App(tk.Tk):
         self._toggle_btns = {}
         self._rebuild_watcher_rows()
 
+        self._staged_frame = ttk.LabelFrame(self, text="Staged Batch", padding=8)
+        self._staged_frame.grid(row=3, column=0, **p, sticky="ew")
+        self._staged_frame.columnconfigure(0, weight=1)
+        self._staged_rows = ttk.Frame(self._staged_frame)
+        self._staged_rows.grid(row=0, column=0, sticky="ew")
+        self._staged_rows.columnconfigure(0, weight=1)
+        self._refresh_staged_panel()
+
         lf = ttk.LabelFrame(self, text="File Activity", padding=10)
-        lf.grid(row=3, column=0, **p, sticky="ew")
+        lf.grid(row=4, column=0, **p, sticky="ew")
         ttk.Label(lf, text="Place official Building Permit face-down on top before scanning.",
                   font=("Segoe UI", 8), foreground="#888888").grid(
                   row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
@@ -1433,7 +1446,7 @@ class App(tk.Tk):
         self.progress_pct.pack(side="left", padx=(6, 0))
 
         bf = ttk.Frame(self)
-        bf.grid(row=4, column=0, **p)
+        bf.grid(row=5, column=0, **p)
         self.confirm_btn = ttk.Button(bf, text="Confirm & Rename", command=self._confirm_rename,
                                       width=18, state="disabled")
         self.confirm_btn.pack(side="left", padx=6)
@@ -1442,7 +1455,7 @@ class App(tk.Tk):
         ttk.Button(bf, text="Open Staging",   command=self._open_staging,  width=13).pack(side="left", padx=6)
 
         bf2 = ttk.Frame(self)
-        bf2.grid(row=5, column=0, padx=12, pady=(0, 6))
+        bf2.grid(row=6, column=0, padx=12, pady=(0, 6))
         ttk.Button(bf2, text="History",       command=self._show_history,  width=9).pack(side="left", padx=6)
         ttk.Button(bf2, text="Search",        command=self._show_archive,  width=8).pack(side="left", padx=6)
         ttk.Button(bf2, text="Property",      command=self._show_property, width=9).pack(side="left", padx=6)
@@ -1452,7 +1465,7 @@ class App(tk.Tk):
         self._stats_var = tk.StringVar()
         ttk.Label(self, textvariable=self._stats_var,
                   font=("Segoe UI", 8), foreground="#888888").grid(
-                  row=6, column=0, pady=(0, 6))
+                  row=7, column=0, pady=(0, 6))
 
     # ── Path helpers ──────────────────────────────────────────────────────────
 
@@ -1520,6 +1533,62 @@ class App(tk.Tk):
         btn.config(text="ON" if active else "OFF",
                    bg="#4caf50" if active else "#f44336",
                    fg="white")
+
+    _STAGED_TAGS = {"official": ("permit", "#2e7d32"),
+                    "application": ("application", "#e65100"),
+                    "unknown": ("orange folder", "#92400e")}
+
+    def _refresh_staged_panel(self):
+        for w in self._staged_rows.winfo_children():
+            w.destroy()
+        if not self.staged:
+            self._staged_frame.config(text="Staged Batch")
+            ttk.Label(self._staged_rows, text="nothing staged",
+                      font=("Segoe UI", 8), foreground="#888888").grid(row=0, column=0, sticky="w")
+            return
+        self._staged_frame.config(text=f"Staged Batch ({len(self.staged)})")
+        for i, entry in enumerate(self.staged):
+            name = os.path.basename(entry["current"])
+            row_f = ttk.Frame(self._staged_rows)
+            row_f.grid(row=i, column=0, sticky="ew", pady=1)
+            disp = name if len(name) <= 34 else name[:31] + "…"
+            ttk.Label(row_f, text=disp, font=("Consolas", 8)).pack(side="left")
+            if entry.get("renamed"):
+                tag, color = "ready to file", "#2e7d32"
+            elif os.path.splitext(name)[1].lower() in _IMAGE_EXTS:
+                tag, color = "plans", "#888888"
+            else:
+                tag, color = self._STAGED_TAGS.get(
+                    self.file_class.get(entry["current"], ""), ("", "#888888"))
+            tk.Button(row_f, text="✕", width=2, relief="flat", cursor="hand2", fg="#b71c1c",
+                      command=lambda e=entry: self._unstage(e)).pack(side="right")
+            ttk.Label(row_f, text=tag, font=("Segoe UI", 8),
+                      foreground=color).pack(side="right", padx=(8, 4))
+
+    def _unstage(self, entry):
+        if self._scanning:
+            self._log("[--] Scan in progress — wait for it to finish before removing files")
+            return
+        name = os.path.basename(entry["current"])
+        if entry.get("renamed"):
+            if not messagebox.askyesno(
+                    "Remove Confirmed File",
+                    f"{name} is confirmed and waiting to be filed in Laserfiche.\n"
+                    "Remove it from staging anyway?"):
+                return
+        try:
+            if os.path.exists(entry["current"]):
+                os.remove(entry["current"])
+        except Exception as e:
+            self._log(f"[!]  Could not remove {name}: {e}")
+            return
+        if entry in self.staged:
+            self.staged.remove(entry)
+        self.file_class.pop(entry["current"], None)
+        self._log(f"[--] Removed {name} from the batch (original stays in the scan folder)")
+        if not any(not e["renamed"] for e in self.staged):
+            self.confirm_btn.config(state="disabled")
+        self._refresh_staged_panel()
 
     def _laserfiche_path(self):
         return laserfiche_path_for(self.street_num.get(), self.street_name.get())
@@ -1649,6 +1718,7 @@ class App(tk.Tk):
             return
 
         self.staged.append({"current": staging_path, "renamed": False})
+        self._refresh_staged_panel()
         self._log(f"[IN]  {filename}  →  staging (copy)")
 
         # Image files are building plans — staged for the merge, never a data source
@@ -1997,7 +2067,26 @@ class App(tk.Tk):
         text, color = _SRC_STYLE.get(source, ("", "#888888"))
         lbl.config(text=text, fg=color)
 
+    def _field_edited(self, field):
+        if self._prog_set:
+            return
+        value = {"permit": self.permit_id, "address": self.street_name,
+                 "sbl": self.sbl}[field].get().strip()
+        # Cleared field goes back to unsourced; manual outranks every extractor,
+        # so a late OCR thread can never overwrite what the user typed
+        source = "manual" if value else ""
+        if self._current_sources.get(field) != source:
+            self._current_sources[field] = source
+            self._update_src_label(field, source)
+
     def _apply_extracted(self, permit, num, street, sbl, sources=None):
+        self._prog_set = True
+        try:
+            self._apply_extracted_inner(permit, num, street, sbl, sources)
+        finally:
+            self._prog_set = False
+
+    def _apply_extracted_inner(self, permit, num, street, sbl, sources=None):
         self._set_progress(100)
         sources = sources or {}
 
@@ -2059,13 +2148,13 @@ class App(tk.Tk):
                 and self.sbl.get().strip():
             self.batch_verified = True
 
+        self._refresh_staged_panel()   # form-type tags may have just been classified
         self.confirm_btn.config(state="normal")
 
     # ── Actions ───────────────────────────────────────────────────────────────
 
     def _confirm_rename(self):
         permit = self.permit_id.get().strip()
-        status = self.status_var.get()
         address = f"{self.street_num.get().strip()} {self.street_name.get().strip().upper()}".strip()
         sbl = self.sbl.get().strip()
 
@@ -2111,14 +2200,14 @@ class App(tk.Tk):
                         f"Address on file: {last.get('address', '—')}\n\nFile it again?"):
                     return
 
-        new_path = os.path.join(STAGING_FOLDER, f"{permit} {status}.pdf")
+        new_path = os.path.join(STAGING_FOLDER, f"{permit}.pdf")
         # An earlier filing of this permit may still be sitting in staging waiting
         # to be dragged into Laserfiche — the merge path would have silently
         # replaced it (os.replace) and the single-file path would have failed.
         new_path = self._free_final_path(new_path, unrenamed)
         new_name = os.path.basename(new_path)
-        if new_name != f"{permit} {status}.pdf":
-            self._log(f"[--] {permit} {status}.pdf is still in staging — "
+        if new_name != f"{permit}.pdf":
+            self._log(f"[--] {permit}.pdf is still in staging — "
                       f"filing this batch as {new_name} so nothing is overwritten")
         self.confirm_btn.config(state="disabled")
         lf_path = self._laserfiche_path()
@@ -2139,13 +2228,13 @@ class App(tk.Tk):
             # A pre-merged batch carries its original filenames — stamp each
             # component's archive row, not the merged name
             pairs = [(c, new_name) for c in entry.get("components", [old_name])]
-            self._finish_confirm(pairs, new_path, permit, address, sbl, status, lf_path)
+            self._finish_confirm(pairs, new_path, permit, address, sbl, lf_path)
             return
 
         # Multiple files (or images): assemble one PDF in filing order
         self._scanning = True
         threading.Thread(target=self._merge_and_finalize,
-                         args=(unrenamed, new_path, permit, address, sbl, status, lf_path),
+                         args=(unrenamed, new_path, permit, address, sbl, lf_path),
                          daemon=True).start()
 
     def _free_final_path(self, new_path, entries):
@@ -2250,9 +2339,10 @@ class App(tk.Tk):
         self.staged[:] = [e for e in self.staged if id(e) not in gone]
         self.staged.append({"current": new_path, "renamed": renamed,
                             "components": components})
+        self._refresh_staged_panel()
         self.confirm_btn.config(state="normal")
 
-    def _merge_and_finalize(self, entries, new_path, permit, address, sbl, status, lf_path):
+    def _merge_and_finalize(self, entries, new_path, permit, address, sbl, lf_path):
         """Worker: merge staged files into one ordered PDF, then finish on the UI thread."""
         try:
             merged, components = self._merge_staged(entries, new_path)
@@ -2263,7 +2353,7 @@ class App(tk.Tk):
             pairs = [(c, os.path.basename(new_path)) for c in components]
             def _finish():
                 self._swap_staged(entries, new_path, components, True)
-                self._finish_confirm(pairs, new_path, permit, address, sbl, status, lf_path)
+                self._finish_confirm(pairs, new_path, permit, address, sbl, lf_path)
             self.after(0, _finish)
         except Exception as ex:
             self.after(0, self._log, f"[X]  Merge failed: {ex}")
@@ -2271,14 +2361,15 @@ class App(tk.Tk):
         finally:
             self._scanning = False
 
-    def _finish_confirm(self, renamed_pairs, new_path, permit, address, sbl, status, lf_path):
-        append_history(permit, address, sbl, status)
+    def _finish_confirm(self, renamed_pairs, new_path, permit, address, sbl, lf_path):
+        append_history(permit, address, sbl)
         try:
-            archive_confirm(renamed_pairs, permit, address, sbl, status, lf_path)
+            archive_confirm(renamed_pairs, permit, address, sbl, "", lf_path)
         except Exception as e:
             self._log(f"[!]  Archive update failed: {e}")
         self._update_stats()
         self.confirm_btn.config(state="disabled")
+        self._refresh_staged_panel()
         self._log(f"[--] {os.path.basename(new_path)} ready — drag from staging to Laserfiche")
 
     def _new_permit(self):
@@ -2301,11 +2392,15 @@ class App(tk.Tk):
         self.file_class.clear()
         self.batch_verified = False
         self._clear_preview()
-        self.permit_id.set("")
-        self.street_num.set("")
-        self.street_name.set("")
-        self.sbl.set("")
-        self.status_var.set("OPEN")
+        self._refresh_staged_panel()
+        self._prog_set = True
+        try:
+            self.permit_id.set("")
+            self.street_num.set("")
+            self.street_name.set("")
+            self.sbl.set("")
+        finally:
+            self._prog_set = False
         self.confirm_btn.config(state="disabled")
         self.log_box.config(state="normal")
         self.log_box.delete("1.0", "end")
@@ -2404,10 +2499,14 @@ class App(tk.Tk):
             if not vals[1]:
                 return
             num, street = split_address(vals[2]) if vals[2] else ("", "")
-            self.permit_id.set(vals[1])
-            self.street_num.set(num)
-            self.street_name.set(street)
-            self.sbl.set(vals[3])
+            self._prog_set = True
+            try:
+                self.permit_id.set(vals[1])
+                self.street_num.set(num)
+                self.street_name.set(street)
+                self.sbl.set(vals[3])
+            finally:
+                self._prog_set = False
             self._current_sources = {"permit": "", "address": "", "sbl": ""}
             for lbl in self._src_labels.values():
                 lbl.config(text="")
@@ -2550,16 +2649,18 @@ class App(tk.Tk):
             rec = _selected_record()
             if not rec:
                 return
-            if rec["permit_id"]:
-                self.permit_id.set(rec["permit_id"])
             num, street = split_address(rec["address"]) if rec["address"] else ("", "")
-            if street:
-                self.street_num.set(num)
-                self.street_name.set(street)
-            if rec["sbl"]:
-                self.sbl.set(rec["sbl"])
-            if rec["status"]:
-                self.status_var.set(rec["status"])
+            self._prog_set = True
+            try:
+                if rec["permit_id"]:
+                    self.permit_id.set(rec["permit_id"])
+                if street:
+                    self.street_num.set(num)
+                    self.street_name.set(street)
+                if rec["sbl"]:
+                    self.sbl.set(rec["sbl"])
+            finally:
+                self._prog_set = False
             status_var.set("Loaded into main form")
 
         ttk.Button(foot, text="Copy LF Path",  command=_copy_lf_path,   width=13).pack(side="right", padx=4)
@@ -2691,10 +2792,14 @@ class App(tk.Tk):
             if not p:
                 return
             m = re.match(r'^(\d+)\s+(.+)$', p["address"] or "")
-            if m:
-                self.street_num.set(m.group(1))
-                self.street_name.set(m.group(2))
-            self.sbl.set(p["sbl"])
+            self._prog_set = True
+            try:
+                if m:
+                    self.street_num.set(m.group(1))
+                    self.street_name.set(m.group(2))
+                self.sbl.set(p["sbl"])
+            finally:
+                self._prog_set = False
             self._current_sources["address"] = "parcel"
             self._current_sources["sbl"] = "parcel"
             self._update_src_label("address", "parcel")
@@ -2790,6 +2895,8 @@ class App(tk.Tk):
         if pending:
             self.confirm_btn.config(state="normal")
             self._log(f"[--] {pending} unfiled file(s) found in staging from previous session")
+        if files:
+            self._refresh_staged_panel()
 
     def _reocr_staging(self):
         if self._scanning:
@@ -2823,6 +2930,7 @@ class App(tk.Tk):
                 self._log(f"[..] Registered: {os.path.basename(p)}")
         if images:
             self.confirm_btn.config(state="normal")
+        self._refresh_staged_panel()
         if not pdfs:
             self._log("[--] No unfiled PDFs staged — nothing to OCR")
             return
@@ -2834,6 +2942,8 @@ class App(tk.Tk):
                 self._reocr_scan_loop(pdfs)
             finally:
                 self._scanning = False
+                # classification tags are known now — repaint the batch panel
+                self.after(0, self._refresh_staged_panel)
         threading.Thread(target=_run_reocr, daemon=True).start()
 
     def _classify_file(self, path) -> str:
