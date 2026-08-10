@@ -47,10 +47,16 @@ _SRC_STYLE   = {
 }
 
 def _load_known_streets():
-    if not os.path.exists(STREET_LIST_FILE):
-        return []
-    with open(STREET_LIST_FILE) as f:
-        return [ln.strip().upper() for ln in f if ln.strip()]
+    # Prefer the copy in the user's home (may be locally updated); fall back to
+    # the copy shipped next to this script so a fresh checkout — CI, a new
+    # office machine — still gets street fuzzy-matching instead of a silent no-op
+    for candidate in (STREET_LIST_FILE,
+                      os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "yorktown_streets.txt")):
+        if os.path.exists(candidate):
+            with open(candidate) as f:
+                return [ln.strip().upper() for ln in f if ln.strip()]
+    return []
 
 KNOWN_STREETS = _load_known_streets()
 
