@@ -146,6 +146,7 @@ def extract_text_from_page(doc, page_idx, printed=False):
     from PIL import Image
     import io
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+    _t0 = time.time()
     page = doc[page_idx]
     native = page.get_text().strip()
     pix = page.get_pixmap(matrix=fitz.Matrix(3.0, 3.0))
@@ -156,6 +157,7 @@ def extract_text_from_page(doc, page_idx, printed=False):
     if printed:
         ocr = ocr_image(img_gray, pytesseract,
                         configs=["--oem 1 --psm 3", "--oem 1 --psm 6"])
+        metric("ocr_invoked", duration_ms=int((time.time() - _t0) * 1000), detail="printed")
         return (native + "\n" + ocr).strip()
     ocr_a = ocr_image(img_gray, pytesseract)
 
@@ -164,6 +166,7 @@ def extract_text_from_page(doc, page_idx, printed=False):
     ocr_b = ocr_image(img_proc, pytesseract)
 
     ocr = ocr_a if _ascii_score(ocr_a) >= _ascii_score(ocr_b) else ocr_b
+    metric("ocr_invoked", duration_ms=int((time.time() - _t0) * 1000), detail="dual")
     return (native + "\n" + ocr).strip()
 
 
@@ -952,6 +955,7 @@ def extract_fields_with_claude(page_png_bytes, api_key, app_no="", model="claude
     cache_key = _claude_cache_key(page_png_bytes, model, app_no)
     cached = _claude_cache_get(cache_key)
     if cached is not None:
+        metric("vision_cache_hit", model=model)
         return cached
     client = anthropic.Anthropic(api_key=api_key)
     img_b64 = base64.standard_b64encode(page_png_bytes).decode()
@@ -1004,6 +1008,7 @@ def extract_fields_with_claude(page_png_bytes, api_key, app_no="", model="claude
         "required": ["permit_id", "address", "section", "block", "lot"],
         "additionalProperties": False,
     }
+    _t0 = time.time()
     response = client.messages.create(
         model=model,
         max_tokens=300,
@@ -1013,6 +1018,13 @@ def extract_fields_with_claude(page_png_bytes, api_key, app_no="", model="claude
             {"type": "text", "text": prompt},
         ]}],
     )
+    _usage = getattr(response, "usage", None)
+    _tin = getattr(_usage, "input_tokens", None)
+    _tout = getattr(_usage, "output_tokens", None)
+    metric("vision_invoked", model=model,
+           duration_ms=int((time.time() - _t0) * 1000),
+           tokens_in=_tin, tokens_out=_tout,
+           cost_usd=_claude_cost(model, _tin, _tout))
     raw = response.content[0].text.strip() if response.content else ""
     try:
         data = json.loads(raw)
@@ -1301,6 +1313,76 @@ def rotate_debug_log():
 
 # ── File watcher ───────────────────────────────────────────────────────────────
 
+# ── Operational telemetry ──────────────────────────────────────────────────────
+# Sanitized by design: events carry event names, document classes, sources,
+# timings, statuses, and token counts — NEVER document text, addresses, permit
+# numbers, or owner names. That makes the whole metrics DB safe to export for
+# dashboards without a scrubbing step. Keep it that way: no new field may carry
+# content read off a scanned document.
+
+METRICS_DB_FILE = os.path.join(_HOME, "permit_scan_metrics.db")
+
+# USD per million tokens (input, output) — estimated-cost accounting only.
+# Anthropic list prices as of 2026-08 (Haiku 4.5: $1/$5, Sonnet 4.6: $3/$15).
+_MODEL_PRICES = {
+    "claude-haiku-4-5-20251001": (1.00, 5.00),
+    "claude-sonnet-4-6": (3.00, 15.00),
+}
+
+# One batch = one permit's worth of scans, ended by New Permit. Module-level so
+# module functions (Claude call, OCR) can attribute events without plumbing.
+_ACTIVE_BATCH = {"id": ""}
+
+
+def _new_batch_id():
+    _ACTIVE_BATCH["id"] = "b" + datetime.now().strftime("%Y%m%d%H%M%S%f")
+    return _ACTIVE_BATCH["id"]
+
+
+def _claude_cost(model, tokens_in, tokens_out):
+    rate = _MODEL_PRICES.get(model)
+    if not rate or tokens_in is None or tokens_out is None:
+        return None
+    return (tokens_in * rate[0] + tokens_out * rate[1]) / 1_000_000
+
+
+def metric(event, doc_class="", source="", field="", status="", model="",
+           duration_ms=None, tokens_in=None, tokens_out=None, cost_usd=None,
+           detail=""):
+    """Fire-and-forget operational telemetry. Swallows every failure —
+    telemetry must never take down or slow the scanning workflow."""
+    try:
+        con = sqlite3.connect(METRICS_DB_FILE, timeout=2)
+        try:
+            con.execute("""CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY,
+                ts          TEXT NOT NULL,
+                event       TEXT NOT NULL,
+                batch_id    TEXT DEFAULT '',
+                doc_class   TEXT DEFAULT '',
+                source      TEXT DEFAULT '',
+                field       TEXT DEFAULT '',
+                status      TEXT DEFAULT '',
+                model       TEXT DEFAULT '',
+                duration_ms INTEGER,
+                tokens_in   INTEGER,
+                tokens_out  INTEGER,
+                cost_usd    REAL,
+                detail      TEXT DEFAULT '')""")
+            con.execute(
+                "INSERT INTO events (ts, event, batch_id, doc_class, source, field,"
+                " status, model, duration_ms, tokens_in, tokens_out, cost_usd, detail)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (datetime.now().isoformat(timespec="seconds"), event,
+                 _ACTIVE_BATCH["id"], doc_class, source, field, status, model,
+                 duration_ms, tokens_in, tokens_out, cost_usd, detail))
+            con.commit()
+        finally:
+            con.close()
+    except Exception:
+        pass
+
+
 class ScanHandler(FileSystemEventHandler):
     def __init__(self, callback):
         self.callback = callback
@@ -1310,15 +1392,25 @@ class ScanHandler(FileSystemEventHandler):
             threading.Thread(target=self._wait_and_notify, args=(event.src_path,), daemon=True).start()
 
     def _wait_and_notify(self, path):
+        # Large plan TIFs on the network share can pause mid-write for over a
+        # second, so one stable 0.5s sample isn't proof the scanner is done —
+        # suspected cause of two plan sheets vanishing from a merge (2026-07-27).
+        # Require the size to hold for 3 consecutive checks, and wait up to
+        # 2 minutes for the biggest sheets.
         prev = -1
-        for _ in range(40):
+        stable = 0
+        for _ in range(240):
             try:
                 size = os.path.getsize(path)
             except OSError:
                 time.sleep(0.5)
                 continue
             if size == prev and size > 0:
-                break
+                stable += 1
+                if stable >= 3:
+                    break
+            else:
+                stable = 0
             prev = size
             time.sleep(0.5)
         self.callback(path)
@@ -1354,6 +1446,7 @@ class App(tk.Tk):
 
         os.makedirs(STAGING_FOLDER, exist_ok=True)
         rotate_debug_log()
+        _new_batch_id()
 
         self._build_ui()
         self._restore_window_pos()
@@ -1772,6 +1865,7 @@ class App(tk.Tk):
         self.staged.append({"current": staging_path, "renamed": False})
         self._refresh_staged_panel()
         self._log(f"[IN]  {filename}  →  staging (copy)")
+        metric("document_ingested", detail=ext)
 
         # Image files are building plans — staged for the merge, never a data source
         if ext in _IMAGE_EXTS:
@@ -2128,8 +2222,12 @@ class App(tk.Tk):
         # so a late OCR thread can never overwrite what the user typed
         source = "manual" if value else ""
         if self._current_sources.get(field) != source:
+            prior = self._current_sources.get(field, "")
             self._current_sources[field] = source
             self._update_src_label(field, source)
+            if source == "manual":
+                # prior tells us which extractor's value the user replaced
+                metric("manual_override", field=field, source=prior)
 
     def _apply_extracted(self, permit, num, street, sbl, sources=None):
         self._prog_set = True
@@ -2168,8 +2266,11 @@ class App(tk.Tk):
             self._current_sources["permit"] = sources.get("permit", "")
             self._update_src_label("permit", sources.get("permit", ""))
             self._log(f"[OK] Permit ID: {permit}")
+            metric("field_filled", field="permit", source=sources.get("permit", ""),
+                   doc_class=form_type)
         elif not self.permit_id.get().strip():
             self._log("[!]  Permit ID not found — enter manually")
+            metric("extraction_failed", field="permit", doc_class=form_type)
 
         if address_wins:
             self.street_num.set(num)
@@ -2180,8 +2281,11 @@ class App(tk.Tk):
                 self._log(f"[OK] Address: {num} {street}")
             else:
                 self._log(f"[?]  Address found (check number): {street}")
+            metric("field_filled", field="address", source=sources.get("address", ""),
+                   doc_class=form_type)
         elif not self.street_name.get().strip():
             self._log("[!]  Address not found — enter manually")
+            metric("extraction_failed", field="address", doc_class=form_type)
 
         self._copy_path()
 
@@ -2190,11 +2294,16 @@ class App(tk.Tk):
             self._current_sources["sbl"] = sources.get("sbl", "")
             self._update_src_label("sbl", sources.get("sbl", ""))
             self._log(f"[OK] SBL: {sbl}  (click Copy when ready)")
+            metric("field_filled", field="sbl", source=sources.get("sbl", ""),
+                   doc_class=form_type)
         elif not self.sbl.get().strip():
             self._log("[!]  SBL not found — enter manually")
+            metric("extraction_failed", field="sbl", doc_class=form_type)
 
         # A complete county-verified triple ends the batch's need for Claude —
         # files that arrive after this point extract with Tesseract only
+        metric("parcel_reconcile", doc_class=form_type,
+               status="verified" if sources.get("verified") else "unverified")
         if sources.get("verified") and permit and \
                 self.permit_id.get().strip() and self.street_name.get().strip() \
                 and self.sbl.get().strip():
@@ -2232,6 +2341,7 @@ class App(tk.Tk):
         except Exception:
             prior_filings = []
         if prior_filings:
+            metric("duplicate_prompted", detail="archive")
             lines = "\n".join(f"   {fn}   ({(when or '')[:10]}{',  ' + st if st else ''})"
                               for fn, when, st, _lf in prior_filings[:5])
             if not messagebox.askyesno(
@@ -2245,6 +2355,7 @@ class App(tk.Tk):
             # first 8 digits but are different permits on different properties
             prior = [e for e in load_history() if e.get("permit_id", "") == permit]
             if prior:
+                metric("duplicate_prompted", detail="history")
                 last = prior[0]
                 if not messagebox.askyesno(
                         "Duplicate Permit",
@@ -2414,6 +2525,7 @@ class App(tk.Tk):
             self._scanning = False
 
     def _finish_confirm(self, renamed_pairs, new_path, permit, address, sbl, lf_path):
+        metric("batch_confirmed", detail=str(len(renamed_pairs)))
         append_history(permit, address, sbl)
         try:
             archive_confirm(renamed_pairs, permit, address, sbl, "", lf_path)
@@ -2443,6 +2555,7 @@ class App(tk.Tk):
         self.staged.clear()
         self.file_class.clear()
         self.batch_verified = False
+        _new_batch_id()   # telemetry: events from here belong to the next permit
         self._clear_preview()
         self._refresh_staged_panel()
         self._prog_set = True
@@ -3063,7 +3176,10 @@ class App(tk.Tk):
         self.after(0, self._log, f"[..] Classifying {len(pdfs)} file(s)...")
         buckets: dict[str, list] = {"official": [], "application": [], "unknown": []}
         for path in pdfs:
+            _t0 = time.time()
             ft = self._classify_file(path)
+            metric("document_classified", doc_class=ft,
+                   duration_ms=int((time.time() - _t0) * 1000))
             self.file_class[path] = ft
             buckets[ft].append(path)
             self.after(0, self._log, f"[..] {os.path.basename(path)} → {_TIER_LABEL[ft]}")
