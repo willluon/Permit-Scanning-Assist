@@ -1,5 +1,7 @@
 # Permit Scanning Assist
 
+[![CI](https://github.com/willluon/Permit-Scanning-Assist/actions/workflows/ci.yml/badge.svg)](https://github.com/willluon/Permit-Scanning-Assist/actions/workflows/ci.yml)
+
 A desktop tool built for the **Town of Yorktown Building Department** that automates the intake of scanned building permits into the department's document management workflow. In daily production use since June 2026 and under active development.
 
 **The problem:** every scanned permit batch used to require a staff member to open the PDF, read the permit number, address, and Section-Block-Lot parcel ID off the page (often handwritten), rename the file by hand, and navigate a deep alphabetical folder tree in Laserfiche to file it. This tool reduces that to: scan, glance at the extracted fields, press Enter, drag one file.
@@ -12,7 +14,7 @@ A desktop tool built for the **Town of Yorktown Building Department** that autom
 - **870+ scanned documents** OCR'd and archived into a searchable full-text index
 - **10,817 pages** across 1,222 historical PDFs classified in a ground-truth census used to measure extraction accuracy and select data sources (see [Measuring Accuracy](#measuring-accuracy-instead-of-assuming-it))
 - **14,407 county parcels** (the entire Town) cross-validate every extracted address and SBL
-- **86 regression tests**, pure logic, run in under 0.1 s with no API/OCR/GUI dependencies
+- **96 regression tests**, pure logic, run in under a second with no API/OCR/GUI dependencies
 - **~1¢ of AI API cost per batch** worst case (down from ~12¢ before caching and skip logic), ~0¢ for clean printed permits
 
 ---
@@ -156,7 +158,7 @@ Filing is currently drag-and-drop plus a clipboard path. Direct integration with
 python -m unittest discover -s tests -v
 ```
 
-86 tests, under 0.1 s, no API/OCR/GUI. They cover classification, field extraction, street normalization, Laserfiche path building, source ranking, staging-filename rules, and — most importantly — the county-reconcile guardrails that keep the tool from "repairing" a misread into a confidently wrong parcel. Tests named `test_KNOWN_LIMITATION_*` pin accepted-but-undesired behavior; they mark what to revisit, not what to trust. Tests needing the parcel DB skip themselves when it's absent.
+96 tests, under a second, no API/OCR/GUI. They cover classification, field extraction, street normalization, Laserfiche path building, source ranking, staging-filename rules, telemetry sanitization (the metrics schema is pinned so no column can ever carry document content), and — most importantly — the county-reconcile guardrails that keep the tool from "repairing" a misread into a confidently wrong parcel. Tests named `test_KNOWN_LIMITATION_*` pin accepted-but-undesired behavior; they mark what to revisit, not what to trust. Tests needing the parcel DB skip themselves when it's absent.
 
 ### Local Data Files (not in repo)
 

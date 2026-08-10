@@ -1241,7 +1241,7 @@ def archive_search(query, limit=200):
             return []
         fts_q = ' '.join(f'"{t}"' for t in toks[:-1]) + f' "{toks[-1]}"*'
         try:
-            return con.execute(f"""
+            return con.execute("""
                 SELECT s.id, s.scanned_at, s.permit_id, s.address, s.sbl, s.status,
                        s.final_name, s.orig_name,
                        snippet(scans_fts, 3, '»', '«', ' … ', 14)
@@ -3120,7 +3120,6 @@ class App(tk.Tk):
             pass
         try:
             import fitz
-            from PIL import Image
             doc = fitz.open(path)
             total_pages = len(doc)
             flip_window = min(3, total_pages)

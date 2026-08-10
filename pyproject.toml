@@ -1,0 +1,15 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+# Correctness-focused: pyflakes (F) + the pycodestyle errors that catch real
+# bugs (comparison mistakes, bare except, syntax). Deliberately NO style rules —
+# the codebase uses compact one-line statements on purpose, and style churn in
+# a 3,200-line production file helps nobody.
+select = ["F", "E7", "E9"]
+ignore = [
+    "E701",  # multiple statements on one line (colon) — house style
+    "E702",  # multiple statements on one line (semicolon) — house style
+    "E731",  # lambda assignment — used for tiny UI callbacks
+]

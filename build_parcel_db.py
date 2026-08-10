@@ -106,7 +106,7 @@ def write_db(rows, db_path=PARCEL_DB):
 
 
 def main():
-    print(f"Downloading Yorktown parcels from NYS GIS...")
+    print("Downloading Yorktown parcels from NYS GIS...")
     rows = download_parcels()
     with_addr = sum(1 for r in rows if r[2] and r[3])
     print(f"Downloaded {len(rows)} parcels ({with_addr} with addresses).")
