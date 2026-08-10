@@ -1,0 +1,142 @@
+{
+  "generated_at": "2026-08-10T10:56:22",
+  "method": "Re-ran the production extraction pipeline headlessly on the original scan files of human-confirmed filings; confirmed field values are the ground truth. Batch-level scoring mirrors the app's source-rank merge.",
+  "dataset": {
+    "batches_evaluated": 14,
+    "files_evaluated": 36,
+    "file_errors": 0,
+    "avg_seconds_per_file": 23.7
+  },
+  "eval_run_cost": {
+    "vision_calls": 23,
+    "cache_hits": 0,
+    "est_cost_usd": 0.1676
+  },
+  "stages": {
+    "native": {
+      "batches_all_three_fields_correct": 0.0,
+      "permit": {
+        "coverage": 0.0,
+        "accuracy_when_found": null,
+        "accuracy_overall": 0.0
+      },
+      "address": {
+        "coverage": 0.0,
+        "accuracy_when_found": null,
+        "accuracy_overall": 0.0,
+        "exact_match_overall": 0.0
+      },
+      "sbl": {
+        "coverage": 0.0,
+        "accuracy_when_found": null,
+        "accuracy_overall": 0.0
+      }
+    },
+    "text": {
+      "batches_all_three_fields_correct": 0.5714,
+      "permit": {
+        "coverage": 1.0,
+        "accuracy_when_found": 1.0,
+        "accuracy_overall": 1.0
+      },
+      "address": {
+        "coverage": 0.9286,
+        "accuracy_when_found": 0.9231,
+        "accuracy_overall": 0.8571,
+        "exact_match_overall": 0.8571
+      },
+      "sbl": {
+        "coverage": 0.9286,
+        "accuracy_when_found": 0.6923,
+        "accuracy_overall": 0.6429
+      }
+    },
+    "claude": {
+      "batches_all_three_fields_correct": 0.6429,
+      "permit": {
+        "coverage": 1.0,
+        "accuracy_when_found": 1.0,
+        "accuracy_overall": 1.0
+      },
+      "address": {
+        "coverage": 1.0,
+        "accuracy_when_found": 0.9286,
+        "accuracy_overall": 0.9286,
+        "exact_match_overall": 0.9286
+      },
+      "sbl": {
+        "coverage": 1.0,
+        "accuracy_when_found": 0.7143,
+        "accuracy_overall": 0.7143
+      }
+    },
+    "full": {
+      "batches_all_three_fields_correct": 0.8571,
+      "permit": {
+        "coverage": 1.0,
+        "accuracy_when_found": 1.0,
+        "accuracy_overall": 1.0
+      },
+      "address": {
+        "coverage": 1.0,
+        "accuracy_when_found": 1.0,
+        "accuracy_overall": 1.0,
+        "exact_match_overall": 1.0
+      },
+      "sbl": {
+        "coverage": 1.0,
+        "accuracy_when_found": 0.8571,
+        "accuracy_overall": 0.8571
+      }
+    }
+  },
+  "classification": {
+    "note": "The AI labeling pass covered only the pages the local classifier abstained on, so this is a missed-forms estimate, not a confusion matrix: pages in the unclassified tail that the AI called a form are candidate local misses (upper bound \u2014 AI labels are keyword-mapped and themselves imperfect).",
+    "pages_total": 10817,
+    "pages_locally_classified": 4081,
+    "local_coverage": 0.3773,
+    "local_class_counts": {
+      "unclassified": 6736,
+      "plans": 1448,
+      "official": 912,
+      "orange_cover": 732,
+      "application": 539,
+      "blank_or_unreadable": 251,
+      "inspection_sheet": 199
+    },
+    "estimated_recall": {
+      "official": {
+        "found_by_local_classifier": 912,
+        "candidate_misses_in_ai_labeled_tail": 27,
+        "estimated_recall": 0.9712
+      },
+      "application": {
+        "found_by_local_classifier": 539,
+        "candidate_misses_in_ai_labeled_tail": 217,
+        "estimated_recall": 0.713
+      },
+      "orange_cover": {
+        "found_by_local_classifier": 732,
+        "candidate_misses_in_ai_labeled_tail": 0,
+        "estimated_recall": 1.0
+      },
+      "inspection_sheet": {
+        "found_by_local_classifier": 199,
+        "candidate_misses_in_ai_labeled_tail": 0,
+        "estimated_recall": 1.0
+      },
+      "plans": {
+        "found_by_local_classifier": 1448,
+        "candidate_misses_in_ai_labeled_tail": 278,
+        "estimated_recall": 0.8389
+      }
+    },
+    "ai_labeled_tail_composition": {
+      "other": 6000,
+      "plans": 278,
+      "application": 217,
+      "blank_or_unreadable": 214,
+      "official": 27
+    }
+  }
+}

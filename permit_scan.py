@@ -1352,6 +1352,16 @@ def _claude_cost(model, tokens_in, tokens_out):
     return (tokens_in * rate[0] + tokens_out * rate[1]) / 1_000_000
 
 
+def _stage_snapshot(app, stage, permit, address, sbl, sources):
+    """Record a mid-pipeline snapshot for the evaluation harness (evaluate.py).
+    Production App instances have no eval_trace attribute, so this is a no-op
+    in normal use — it only fires under the harness's headless stub."""
+    trace = getattr(app, "eval_trace", None)
+    if trace is not None:
+        trace[stage] = {"permit": permit, "address": address, "sbl": sbl,
+                        "sources": dict(sources)}
+
+
 def metric(event, doc_class="", source="", field="", status="", model="",
            duration_ms=None, tokens_in=None, tokens_out=None, cost_usd=None,
            detail=""):
@@ -2053,6 +2063,7 @@ class App(tk.Tk):
         if permit:  sources["permit"]  = text_source
         if address: sources["address"] = text_source
         if sbl:     sources["sbl"]     = text_source
+        _stage_snapshot(self, "text", permit, address, sbl, sources)
 
         # Claude fills missing fields; for handwritten-heavy forms (orange folder,
         # application) it also overrides tesseract_hw
@@ -2117,6 +2128,7 @@ class App(tk.Tk):
                         sources["sbl"] = "claude"
                 except Exception as e:
                     self.after(0, self._log, f"[!]  Claude error: {e}")
+        _stage_snapshot(self, "claude", permit, address, sbl, sources)
 
         # Fallback tier: electrical certs / plan-review pages elsewhere in this
         # file. Lowest rank, fill-only — nothing here can displace a value found
@@ -2173,6 +2185,7 @@ class App(tk.Tk):
                                "looked up from a permit ID alone")
             except Exception as e:
                 self.after(0, self._log, f"[!]  History lookup error: {e}")
+        _stage_snapshot(self, "fallback", permit, address, sbl, sources)
 
         doc.close()
         num, street = split_address(address) if address else ("", "")
